@@ -1,5 +1,5 @@
 param(
-    [string]$Executable = ".\out\AIUsageMonitorSpike-win32-x64\AIUsageMonitorSpike.exe"
+    [string]$Executable = ".\out\AIUsageMonitor-win32-x64\AIUsageMonitor.exe"
 )
 
 $ErrorActionPreference = "Stop"

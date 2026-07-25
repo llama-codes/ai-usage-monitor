@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "outDir": "dist-test",
+    "rootDir": "src",
+    "types": ["node"],
+    "esModuleInterop": true
+  },
+  "include": [
+    "src/main/position.ts",
+    "src/main/position.test.ts",
+    "src/shared/contracts.ts",
+    "src/shared/contracts.test.ts"
+  ]
+}
