@@ -1,0 +1,15 @@
+{
+  "model": {
+    "display_name": "Claude"
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 54,
+      "resets_at": 1800000000
+    },
+    "seven_day": {
+      "used_percentage": 12,
+      "resets_at": 1800604800
+    }
+  }
+}

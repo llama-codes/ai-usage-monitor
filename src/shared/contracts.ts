@@ -8,7 +8,9 @@ export type QuotaWindowMinutes =
 
 export type ProviderConnectionState =
   | "connected"
+  | "no-data-yet"
   | "not-connected"
+  | "error"
   | "unsupported";
 
 export type QuotaWindow = {
@@ -107,7 +109,9 @@ function isQuotaWindow(value: unknown): value is QuotaWindow {
 function isConnectionState(value: unknown): value is ProviderConnectionState {
   return (
     value === "connected" ||
+    value === "no-data-yet" ||
     value === "not-connected" ||
+    value === "error" ||
     value === "unsupported"
   );
 }

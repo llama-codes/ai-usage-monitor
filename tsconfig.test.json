@@ -4,7 +4,7 @@
     "module": "Node16",
     "moduleResolution": "Node16",
     "outDir": "dist-test",
-    "rootDir": "src",
+    "rootDir": ".",
     "types": ["node"],
     "esModuleInterop": true
   },
@@ -13,7 +13,14 @@
     "src/main/position.test.ts",
     "src/main/providers/codex.ts",
     "src/main/providers/codex.test.ts",
+    "src/main/providers/claude.ts",
+    "src/main/providers/claude.test.ts",
+    "src/main/providers/claude-installer.ts",
+    "src/main/providers/claude-installer.test.ts",
+    "src/shared/claude-cache.ts",
+    "src/shared/claude-cache.test.ts",
     "src/shared/contracts.ts",
-    "src/shared/contracts.test.ts"
+    "src/shared/contracts.test.ts",
+    "scripts/statusline.ts"
   ]
 }

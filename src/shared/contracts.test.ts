@@ -54,6 +54,21 @@ test("allows absent windows for supported providers not yet connected", () => {
   );
 });
 
+test("distinguishes no-data and safe provider errors", () => {
+  for (const connectionState of ["no-data-yet", "error"]) {
+    assert.equal(
+      isQuotaSnapshot({
+        providerId: "claude",
+        connectionState,
+        windows: [],
+        capturedAt: 1_799_999_900,
+        error: "Safe provider state.",
+      }),
+      true,
+    );
+  }
+});
+
 test("represents unsupported providers without manufacturing usage", () => {
   assert.equal(
     isQuotaSnapshot({

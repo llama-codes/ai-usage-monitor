@@ -20,6 +20,7 @@ import {
   type QuotaSnapshot,
 } from "../shared/contracts";
 import { positionPopup } from "./position";
+import { ClaudeQuotaProvider } from "./providers/claude";
 import { CodexQuotaProvider } from "./providers/codex";
 
 const POPUP_SIZE = { width: 340, height: 420 };
@@ -52,6 +53,17 @@ const codexProvider = SELF_TEST
       dispose: () => undefined,
     }
   : new CodexQuotaProvider();
+const claudeProvider = SELF_TEST
+  ? {
+      readQuota: async (): Promise<QuotaSnapshot> => ({
+        providerId: "claude",
+        connectionState: "no-data-yet",
+        windows: [],
+        capturedAt: Math.floor(Date.now() / 1_000),
+        error: "Claude provider has no self-test fixture.",
+      }),
+    }
+  : new ClaudeQuotaProvider();
 
 const rendererPath = path.join(__dirname, "..", "renderer", "index.html");
 const rendererUrl = pathToFileURL(rendererPath).toString();
@@ -84,16 +96,9 @@ function log(event: string, details: Record<string, unknown> = {}): void {
 }
 
 async function readProviderSnapshots(): Promise<QuotaSnapshot[]> {
-  const capturedAt = Math.floor(Date.now() / 1_000);
   const snapshots: QuotaSnapshot[] = [
     await codexProvider.readQuota(),
-    {
-      providerId: "claude",
-      connectionState: "not-connected",
-      windows: [],
-      capturedAt,
-      error: "Provider integration is not implemented.",
-    },
+    await claudeProvider.readQuota(),
   ];
 
   if (!snapshots.every(isQuotaSnapshot)) {

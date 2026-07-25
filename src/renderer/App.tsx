@@ -51,7 +51,7 @@ export function App() {
         </p>
         <h1 className="mt-1 text-xl font-semibold">AI Usage Monitor</h1>
         <p className="mt-2 text-sm leading-5 text-slate-400">
-          Codex usage is live. Claude integration arrives in a later step.
+          Codex is live. Claude reads the latest statusline cache.
         </p>
       </header>
 
