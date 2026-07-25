@@ -4,6 +4,8 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
+  powerMonitor,
   screen,
   Tray,
   type IpcMainInvokeEvent,
@@ -21,6 +23,16 @@ import {
   type QuotaSnapshot,
 } from "../shared/contracts";
 import { positionPopup } from "./position";
+import {
+  didProviderRefreshFail,
+  POLL_INTERVAL_MS,
+  QuotaMonitorPolicy,
+  type MonitorNotification,
+  type ThresholdNotification,
+  type TraySeverity,
+} from "./monitor-state";
+import { BackgroundTaskScheduler } from "./background-task";
+import { retainNotification } from "./notification-lifetime";
 import { ClaudeQuotaProvider } from "./providers/claude";
 import { CodexQuotaProvider } from "./providers/codex";
 
@@ -31,27 +43,52 @@ const LOG_PATH = process.env.AUM_SPIKE_LOG;
 
 type RuntimeState = {
   backgroundTicks: number;
+  broadcasts: number;
   refreshes: number;
   rendererQuitRequests: number;
+  providerReads: number;
+  notifications: number;
+  pollRefreshes: number;
+  resumeRefreshes: number;
+  trayRecreations: number;
 };
 
 const state: RuntimeState = {
   backgroundTicks: 0,
+  broadcasts: 0,
   refreshes: 0,
   rendererQuitRequests: 0,
+  providerReads: 0,
+  notifications: 0,
+  pollRefreshes: 0,
+  resumeRefreshes: 0,
+  trayRecreations: 0,
 };
 
 let popup: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
+let currentTraySeverity: TraySeverity = "warning";
+let refreshInFlight: Promise<QuotaSnapshot[]> | null = null;
+let pollTimer: NodeJS.Timeout | undefined;
+let trayWatchdogTimer: NodeJS.Timeout | undefined;
+let selfTestHeartbeatTimer: NodeJS.Timeout | undefined;
+const monitorPolicy = new QuotaMonitorPolicy();
+const selfTestNotificationActivations: Array<() => void> = [];
+const activeNotifications = new Set<Notification>();
+const backgroundTasks = new BackgroundTaskScheduler((error) => {
+  safeLog("background-task-failed", {
+    message: error instanceof Error ? error.message : "Unknown error",
+  });
+});
 const codexProvider = SELF_TEST
   ? {
       readQuota: async (): Promise<QuotaSnapshot> => ({
         providerId: "codex",
-        connectionState: "not-connected",
+        connectionState: "error",
         windows: [],
         capturedAt: Math.floor(Date.now() / 1_000),
-        error: "Codex provider is disabled during the Electron self-test.",
+        error: "Codex self-test refresh failed.",
       }),
       dispose: () => undefined,
     }
@@ -67,6 +104,20 @@ const claudeProvider = SELF_TEST
       }),
     }
   : new ClaudeQuotaProvider();
+
+type ProviderReader = {
+  providerId: "codex" | "claude";
+  readQuota: () => Promise<QuotaSnapshot>;
+};
+
+type RefreshReason = "startup" | "poll" | "user" | "tray-menu" | "resume";
+
+const providerReaders: ProviderReader[] = [
+  { providerId: "codex", readQuota: () => codexProvider.readQuota() },
+  { providerId: "claude", readQuota: () => claudeProvider.readQuota() },
+];
+
+let cachedSnapshots = createInitialSnapshots();
 
 const rendererPath = path.join(__dirname, "..", "renderer", "index.html");
 const rendererUrl = pathToFileURL(rendererPath).toString();
@@ -84,6 +135,7 @@ let trayIconMetadata:
       scaleFactors: number[];
     }
   | undefined;
+const trayImageCache = new Map<TraySeverity, NativeImage>();
 
 function log(event: string, details: Record<string, unknown> = {}): void {
   const entry = JSON.stringify({
@@ -98,16 +150,139 @@ function log(event: string, details: Record<string, unknown> = {}): void {
   }
 }
 
-async function readProviderSnapshots(): Promise<QuotaSnapshot[]> {
-  const snapshots: QuotaSnapshot[] = [
-    await codexProvider.readQuota(),
-    await claudeProvider.readQuota(),
-  ];
-
-  if (!snapshots.every(isQuotaSnapshot)) {
-    throw new Error("Internal quota snapshot failed contract validation");
+function safeLog(event: string, details: Record<string, unknown> = {}): void {
+  try {
+    log(event, details);
+  } catch {
+    // Diagnostics must not turn a background failure into an unhandled error.
   }
-  return snapshots;
+}
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1_000);
+}
+
+function createInitialSnapshots(): QuotaSnapshot[] {
+  const capturedAt = nowSeconds();
+  return [
+    {
+      providerId: "codex",
+      connectionState: SELF_TEST ? "not-connected" : "no-data-yet",
+      windows: [],
+      capturedAt,
+      ...(SELF_TEST
+        ? { error: "Codex provider is disabled during the Electron self-test." }
+        : {}),
+    },
+    {
+      providerId: "claude",
+      connectionState: "no-data-yet",
+      windows: [],
+      capturedAt,
+    },
+  ];
+}
+
+function createProviderErrorSnapshot(
+  providerId: string,
+): QuotaSnapshot {
+  return {
+    providerId,
+    connectionState: "error",
+    windows: [],
+    capturedAt: nowSeconds(),
+    error: `${providerId === "codex" ? "Codex" : "Claude Code"} refresh failed.`,
+  };
+}
+
+async function readProviderSafely(
+  reader: ProviderReader,
+): Promise<QuotaSnapshot> {
+  state.providerReads += 1;
+  try {
+    const snapshot = await reader.readQuota();
+    if (
+      !isQuotaSnapshot(snapshot) ||
+      snapshot.providerId !== reader.providerId
+    ) {
+      throw new Error("Provider returned an invalid quota snapshot");
+    }
+    return snapshot;
+  } catch {
+    log("provider-refresh-failed", { providerId: reader.providerId });
+    return createProviderErrorSnapshot(reader.providerId);
+  }
+}
+
+async function refreshProviderSnapshots(): Promise<{
+  snapshots: QuotaSnapshot[];
+  refreshFailed: boolean;
+}> {
+  const snapshots = await Promise.all(providerReaders.map(readProviderSafely));
+  return {
+    snapshots,
+    refreshFailed: didProviderRefreshFail(snapshots),
+  };
+}
+
+function broadcastCachedSnapshots(): void {
+  if (
+    popup &&
+    !popup.isDestroyed() &&
+    !popup.webContents.isLoading()
+  ) {
+    try {
+      popup.webContents.send(IPC_CHANNELS.quotaUpdated, cachedSnapshots);
+      state.broadcasts += 1;
+    } catch (error) {
+      log("renderer-broadcast-failed", {
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+}
+
+async function refreshMonitor(reason: RefreshReason): Promise<QuotaSnapshot[]> {
+  if (refreshInFlight) {
+    log("refresh-coalesced", { reason });
+    return refreshInFlight;
+  }
+
+  const operation = (async () => {
+    state.refreshes += 1;
+    if (reason === "poll") {
+      state.pollRefreshes += 1;
+    } else if (reason === "resume") {
+      state.resumeRefreshes += 1;
+    }
+    log("refresh", { refreshes: state.refreshes, reason });
+
+    const result = await refreshProviderSnapshots();
+    cachedSnapshots = result.snapshots;
+    const decision = monitorPolicy.evaluate({
+      snapshots: cachedSnapshots,
+      refreshFailed: result.refreshFailed,
+      nowSeconds: nowSeconds(),
+    });
+    updateTraySeverity(decision.traySeverity);
+    broadcastCachedSnapshots();
+    for (const notification of decision.notifications) {
+      deliverNotification(notification);
+    }
+    return cachedSnapshots;
+  })();
+  refreshInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (refreshInFlight === operation) {
+      refreshInFlight = null;
+    }
+  }
+}
+
+function scheduleRefresh(reason: RefreshReason): Promise<void> {
+  return backgroundTasks.run(() => refreshMonitor(reason));
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
@@ -126,7 +301,7 @@ async function readQuota(
   event: IpcMainInvokeEvent,
 ): Promise<QuotaSnapshot[]> {
   assertTrustedSender(event);
-  return readProviderSnapshots();
+  return cachedSnapshots;
 }
 
 async function forceRefresh(
@@ -138,9 +313,7 @@ async function forceRefresh(
     throw new TypeError("Invalid forced-refresh request");
   }
 
-  state.refreshes += 1;
-  log("refresh", { refreshes: state.refreshes, reason: payload.reason });
-  return readProviderSnapshots();
+  return refreshMonitor(payload.reason);
 }
 
 async function quitFromRenderer(
@@ -192,6 +365,7 @@ function showPopup(trayBounds: Rectangle, reason: string): void {
   if (!popup) {
     return;
   }
+  broadcastCachedSnapshots();
   placePopup(trayBounds);
   popup.show();
   log("popup-shown-focused", {
@@ -209,14 +383,18 @@ function togglePopup(trayBounds: Rectangle): void {
   }
 }
 
-function createTrayImage(): NativeImage {
+function createTrayImage(severity: TraySeverity): NativeImage {
+  const cached = trayImageCache.get(severity);
+  if (cached) {
+    return cached;
+  }
   const assetDirectory = path.join(app.getAppPath(), "assets", "icons");
   let image: NativeImage | undefined;
 
   for (const representation of trayRepresentations) {
     const assetPath = path.join(
       assetDirectory,
-      `tray-${representation.size}.png`,
+      `tray-${severity}-${representation.size}.png`,
     );
     const buffer = fs.readFileSync(assetPath);
     const decoded = nativeImage.createFromBuffer(buffer);
@@ -249,8 +427,19 @@ function createTrayImage(): NativeImage {
     assetDirectory,
     scaleFactors: image.getScaleFactors(),
   };
-  log("tray-icon-loaded", trayIconMetadata);
+  trayImageCache.set(severity, image);
+  log("tray-icon-loaded", { ...trayIconMetadata, severity });
   return image;
+}
+
+function updateTraySeverity(severity: TraySeverity): void {
+  currentTraySeverity = severity;
+  if (!tray || tray.isDestroyed()) {
+    return;
+  }
+  tray.setImage(createTrayImage(severity));
+  tray.setToolTip(`AI Usage Monitor — ${severity}`);
+  log("tray-state-updated", { severity });
 }
 
 function createPopup(): BrowserWindow {
@@ -290,19 +479,17 @@ function createPopup(): BrowserWindow {
   return window;
 }
 
-async function requestRefreshFromTray(): Promise<void> {
-  state.refreshes += 1;
-  log("refresh", { refreshes: state.refreshes, reason: "tray-menu" });
-  await readProviderSnapshots();
+function requestRefreshFromTray(): void {
+  void scheduleRefresh("tray-menu");
 }
 
-function createTray(): Tray {
-  const appTray = new Tray(createTrayImage());
-  appTray.setToolTip("AI Usage Monitor");
+function createTray(reason: string): Tray {
+  const appTray = new Tray(createTrayImage(currentTraySeverity));
+  appTray.setToolTip(`AI Usage Monitor — ${currentTraySeverity}`);
   appTray.on("click", (_event, bounds) => togglePopup(bounds));
   appTray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "Refresh", click: () => void requestRefreshFromTray() },
+      { label: "Refresh", click: requestRefreshFromTray },
       { type: "separator" },
       {
         label: "Quit",
@@ -314,12 +501,149 @@ function createTray(): Tray {
       },
     ]),
   );
-  log("tray-created", { trayBounds: appTray.getBounds() });
+  log("tray-created", {
+    trayBounds: appTray.getBounds(),
+    reason,
+    severity: currentTraySeverity,
+  });
   return appTray;
+}
+
+function ensureTray(reason: string): Tray {
+  let usable = false;
+  if (tray && !tray.isDestroyed()) {
+    try {
+      const bounds = tray.getBounds();
+      usable = bounds.width > 0 && bounds.height > 0;
+    } catch {
+      usable = false;
+    }
+  }
+  if (usable && tray) {
+    return tray;
+  }
+
+  if (tray && !tray.isDestroyed()) {
+    tray.destroy();
+  }
+  tray = createTray(reason);
+  state.trayRecreations += 1;
+  log("tray-recreated", {
+    reason,
+    recreations: state.trayRecreations,
+  });
+  return tray;
+}
+
+function openPanelFromNotification(): void {
+  const activeTray = ensureTray("notification");
+  showPopup(activeTray.getBounds(), "notification");
+}
+
+function providerDisplayName(providerId: string): string {
+  return providerId === "claude" ? "Claude Code" : "Codex";
+}
+
+function quotaWindowName(windowMinutes: number): string {
+  return windowMinutes === 300 ? "5-hour" : "weekly";
+}
+
+function thresholdNotificationCopy(
+  notification: ThresholdNotification,
+): { title: string; body: string } {
+  const provider = providerDisplayName(notification.providerId);
+  const remaining = Math.max(0, Math.round(100 - notification.usedPercent));
+  const level =
+    notification.threshold === 100
+      ? "limit reached"
+      : notification.threshold === 90
+        ? "quota critical"
+        : "quota warning";
+  return {
+    title: `${provider} ${level}`,
+    body: `${quotaWindowName(notification.windowMinutes)} usage is ${Math.round(notification.usedPercent)}% · ${remaining}% left.`,
+  };
+}
+
+function deliverNotification(notification: MonitorNotification): void {
+  const copy =
+    notification.kind === "threshold"
+      ? thresholdNotificationCopy(notification)
+      : {
+          title: "AI usage refresh failed",
+          body: "Three consecutive refresh attempts failed. Open the panel for details.",
+        };
+  state.notifications += 1;
+  log("notification-created", {
+    kind: notification.kind,
+    notifications: state.notifications,
+  });
+
+  if (SELF_TEST) {
+    selfTestNotificationActivations.push(openPanelFromNotification);
+    return;
+  }
+  if (!Notification.isSupported()) {
+    log("notification-unsupported", { kind: notification.kind });
+    return;
+  }
+  try {
+    const nativeNotification = new Notification(copy);
+    const lifetime = retainNotification(
+      activeNotifications,
+      nativeNotification,
+      (error) => {
+        safeLog("notification-failed", {
+          kind: notification.kind,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+    nativeNotification.on("click", () => {
+      lifetime.release();
+      openPanelFromNotification();
+    });
+    nativeNotification.on("close", lifetime.release);
+    nativeNotification.on("failed", (_event, error) => {
+      lifetime.fail(error);
+    });
+    try {
+      nativeNotification.show();
+    } catch (error) {
+      lifetime.fail(error);
+    }
+  } catch (error) {
+    safeLog("notification-failed", {
+      kind: notification.kind,
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function handleSystemResume(): Promise<void> {
+  const activeAtResume = refreshInFlight;
+  return backgroundTasks.runAfterSettled(activeAtResume, async () => {
+    log("system-resume");
+    ensureTray("system-resume");
+    await refreshMonitor("resume");
+  });
+}
+
+function startBackgroundMonitoring(): void {
+  void scheduleRefresh("startup");
+  pollTimer = setInterval(() => {
+    void scheduleRefresh("poll");
+  }, POLL_INTERVAL_MS);
+  pollTimer.unref();
+
+  trayWatchdogTimer = setInterval(() => {
+    void backgroundTasks.run(() => ensureTray("explorer-watchdog"));
+  }, 10_000);
+  trayWatchdogTimer.unref();
 }
 
 async function waitForRenderer(): Promise<void> {
@@ -350,7 +674,12 @@ async function verifyRendererBoundary(): Promise<void> {
     apiFrozen: boolean;
   };
 
-  const expectedKeys = ["forceRefresh", "quit", "readQuota"];
+  const expectedKeys = [
+    "forceRefresh",
+    "onQuotaUpdated",
+    "quit",
+    "readQuota",
+  ];
   if (
     boundary.processType !== "undefined" ||
     boundary.requireType !== "undefined" ||
@@ -424,22 +753,53 @@ async function runSelfTest(): Promise<void> {
     ...trayIconMetadata,
     packaged: app.isPackaged,
   });
+  for (const severity of [
+    "healthy",
+    "warning",
+    "critical",
+  ] satisfies TraySeverity[]) {
+    const stateImage = createTrayImage(severity);
+    if (stateImage.getScaleFactors().length !== trayRepresentations.length) {
+      throw new Error(`Tray state ${severity} is missing representations`);
+    }
+  }
+  log("self-test-tray-states-pass");
   await verifyRendererBoundary();
 
   const snapshots = (await popup.webContents.executeJavaScript(
     "window.aiUsageMonitor.readQuota()",
   )) as unknown[];
-  if (snapshots.length !== 2) {
-    throw new Error("Read request did not return placeholder snapshots");
+  if (snapshots.length !== 2 || state.providerReads !== 0) {
+    throw new Error("Read request did not return the immediate memory cache");
   }
-  log("self-test-read-pass", { snapshots: snapshots.length });
+  log("self-test-read-pass", {
+    snapshots: snapshots.length,
+    providerReads: state.providerReads,
+  });
   await verifyPanelRendering();
+
+  const invalidListenerRejected =
+    (await popup.webContents.executeJavaScript(`(() => {
+      try {
+        window.aiUsageMonitor.onQuotaUpdated(null);
+        return false;
+      } catch {
+        return true;
+      }
+    })()`)) as boolean;
+  if (!invalidListenerRejected) {
+    throw new Error("Preload accepted an invalid quota update listener");
+  }
 
   await popup.webContents.executeJavaScript(
     'window.aiUsageMonitor.forceRefresh({ reason: "user" })',
   );
-  if (state.refreshes !== 1) {
-    throw new Error("Forced refresh request did not update main state");
+  if (
+    Number(state.refreshes) !== 1 ||
+    Number(state.providerReads) !== 2 ||
+    Number(state.broadcasts) !== 1
+  ) {
+    throw new Error("Forced refresh did not update the cached provider state");
   }
   log("self-test-refresh-pass");
 
@@ -449,10 +809,74 @@ async function runSelfTest(): Promise<void> {
         .forceRefresh({ reason: "timer" })
         .then(() => false, () => true)`,
     )) as boolean;
-  if (!invalidRefreshRejected || state.refreshes !== 1) {
+  if (!invalidRefreshRejected || Number(state.refreshes) !== 1) {
     throw new Error("Invalid forced-refresh payload was not rejected");
   }
   log("self-test-invalid-refresh-pass");
+
+  await popup.webContents.executeJavaScript(
+    'window.aiUsageMonitor.forceRefresh({ reason: "user" })',
+  );
+  await popup.webContents.executeJavaScript(
+    'window.aiUsageMonitor.forceRefresh({ reason: "user" })',
+  );
+  if (
+    Number(state.refreshes) !== 3 ||
+    Number(state.providerReads) !== 6 ||
+    Number(state.notifications) !== 1 ||
+    selfTestNotificationActivations.length !== 1
+  ) {
+    throw new Error("Third-failure notification policy failed at runtime");
+  }
+  log("self-test-failure-notification-pass", {
+    refreshes: state.refreshes,
+    notifications: state.notifications,
+  });
+
+  const activateNotification = selfTestNotificationActivations.shift();
+  activateNotification?.();
+  await delay(100);
+  if (!popup.isVisible() || !popup.isFocused()) {
+    throw new Error("Notification activation did not open the panel");
+  }
+  hidePopup("self-test-notification");
+  log("self-test-notification-activation-pass");
+
+  await handleSystemResume();
+  await scheduleRefresh("poll");
+  if (
+    state.resumeRefreshes !== 1 ||
+    state.pollRefreshes !== 1 ||
+    state.refreshes !== 5 ||
+    state.notifications !== 1
+  ) {
+    throw new Error("Resume or poll refresh lifecycle failed");
+  }
+  log("self-test-monitor-lifecycle-pass", {
+    pollRefreshes: state.pollRefreshes,
+    resumeRefreshes: state.resumeRefreshes,
+  });
+
+  const readsBeforeCachedRead = state.providerReads;
+  await popup.webContents.executeJavaScript("window.aiUsageMonitor.readQuota()");
+  if (state.providerReads !== readsBeforeCachedRead) {
+    throw new Error("Cached read unexpectedly touched a provider");
+  }
+  log("self-test-cached-read-pass");
+
+  const originalTray = tray;
+  originalTray.destroy();
+  const recreatedTray = ensureTray("self-test-explorer-restart");
+  if (
+    recreatedTray === originalTray ||
+    recreatedTray.isDestroyed() ||
+    state.trayRecreations !== 1
+  ) {
+    throw new Error("Tray recreation watchdog behavior failed");
+  }
+  log("self-test-tray-recreation-pass", {
+    recreations: state.trayRecreations,
+  });
 
   const trayBounds = tray.getBounds();
   showPopup(trayBounds, "self-test-focus");
@@ -505,42 +929,53 @@ app.on("window-all-closed", () => {
 
 app.whenReady().then(async () => {
   popup = createPopup();
-  tray = createTray();
-
-  setInterval(() => {
-    state.backgroundTicks += 1;
-    if (state.backgroundTicks % 20 === 0) {
-      log("background-heartbeat", {
-        backgroundTicks: state.backgroundTicks,
-        popupVisible: popup?.isVisible(),
-      });
-    }
-  }, 250).unref();
+  tray = createTray("startup");
+  powerMonitor.on("resume", handleSystemResume);
 
   if (SELF_TEST) {
+    selfTestHeartbeatTimer = setInterval(() => {
+      state.backgroundTicks += 1;
+    }, 250);
+    selfTestHeartbeatTimer.unref();
     try {
       await runSelfTest();
-  } catch (error) {
+    } catch (error) {
       log("self-test-fail", {
         error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof Error && error.stack
+          ? { stack: error.stack }
+          : {}),
       });
       quitting = true;
       app.exit(1);
     }
-  } else if (MANUAL_HARNESS) {
-    setTimeout(() => {
-      if (tray) {
-        showPopup(tray.getBounds(), "manual-harness");
-      }
-    }, 750);
-    log("manual-harness-ready", {
-      expectedBehavior:
-        "show focuses the popup; clicking outside emits blur and hides it",
-    });
+  } else {
+    startBackgroundMonitoring();
+    if (MANUAL_HARNESS) {
+      setTimeout(() => {
+        if (tray) {
+          showPopup(tray.getBounds(), "manual-harness");
+        }
+      }, 750);
+      log("manual-harness-ready", {
+        expectedBehavior:
+          "show focuses the popup; clicking outside emits blur and hides it",
+      });
+    }
   }
 });
 
 app.on("before-quit", () => {
   quitting = true;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+  }
+  if (trayWatchdogTimer) {
+    clearInterval(trayWatchdogTimer);
+  }
+  if (selfTestHeartbeatTimer) {
+    clearInterval(selfTestHeartbeatTimer);
+  }
+  activeNotifications.clear();
   codexProvider.dispose();
 });

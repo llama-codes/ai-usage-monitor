@@ -14,7 +14,7 @@
     "build:tools": "tsc -p tsconfig.tools.json",
     "build:renderer": "vite build",
     "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.tools.json --noEmit && tsc -p tsconfig.renderer.json --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "npm run clean:test && tsc -p tsconfig.test.json && node --test dist-test/src/main/position.test.js dist-test/src/main/providers/*.test.js dist-test/src/shared/*.test.js dist-test/src/renderer/*.test.js",
+    "test": "npm run clean:test && tsc -p tsconfig.test.json && node --test dist-test/src/main/*.test.js dist-test/src/main/providers/*.test.js dist-test/src/shared/*.test.js dist-test/src/renderer/*.test.js",
     "probe:codex": "npm run build:electron && node scripts/probe-codex.js",
     "probe:claude": "npm run build && node scripts/probe-claude.js",
     "claude:install": "npm run build:tools && node dist-tools/scripts/install-claude-statusline.js",

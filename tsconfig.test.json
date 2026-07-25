@@ -11,6 +11,12 @@
   "include": [
     "src/main/position.ts",
     "src/main/position.test.ts",
+    "src/main/background-task.ts",
+    "src/main/background-task.test.ts",
+    "src/main/notification-lifetime.ts",
+    "src/main/notification-lifetime.test.ts",
+    "src/main/monitor-state.ts",
+    "src/main/monitor-state.test.ts",
     "src/main/providers/codex.ts",
     "src/main/providers/codex.test.ts",
     "src/main/providers/claude.ts",

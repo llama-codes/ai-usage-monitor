@@ -3,6 +3,7 @@ const path = require("node:path");
 const { ICON_SIZES, decodePng } = require("./icon-lib");
 
 const iconDirectory = path.resolve("assets", "icons");
+const stateSamples = [];
 
 function verifyPixels(name, decoded) {
   let opaquePixels = 0;
@@ -42,13 +43,28 @@ function verifyPixels(name, decoded) {
   }
 }
 
-for (const size of ICON_SIZES) {
-  const name = `tray-${size}.png`;
-  const decoded = decodePng(fs.readFileSync(path.join(iconDirectory, name)));
-  if (decoded.width !== size || decoded.height !== size) {
-    throw new Error(`${name} has incorrect dimensions`);
+for (const state of ["healthy", "warning", "critical"]) {
+  for (const size of ICON_SIZES) {
+    const name = `tray-${state}-${size}.png`;
+    const buffer = fs.readFileSync(path.join(iconDirectory, name));
+    const decoded = decodePng(buffer);
+    if (decoded.width !== size || decoded.height !== size) {
+      throw new Error(`${name} has incorrect dimensions`);
+    }
+    verifyPixels(name, decoded);
+    if (size === 16) {
+      stateSamples.push({ state, buffer });
+    }
   }
-  verifyPixels(name, decoded);
+}
+for (let left = 0; left < stateSamples.length; left += 1) {
+  for (let right = left + 1; right < stateSamples.length; right += 1) {
+    if (stateSamples[left].buffer.equals(stateSamples[right].buffer)) {
+      throw new Error(
+        `${stateSamples[left].state} and ${stateSamples[right].state} tray states are identical`,
+      );
+    }
+  }
 }
 
 const ico = fs.readFileSync(path.join(iconDirectory, "app.ico"));
@@ -85,5 +101,5 @@ if (JSON.stringify(icoSizes) !== JSON.stringify(ICON_SIZES)) {
 }
 
 process.stdout.write(
-  `PASS: PNG and ICO assets decode with sizes ${icoSizes.join(", ")} and non-empty high-contrast artwork.\n`,
+  `PASS: healthy, warning, and critical tray PNGs plus ICO decode with sizes ${icoSizes.join(", ")}.\n`,
 );

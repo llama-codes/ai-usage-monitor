@@ -322,6 +322,11 @@ export function App() {
 
   useEffect(() => {
     let active = true;
+    const unsubscribe = window.aiUsageMonitor.onQuotaUpdated((snapshots) => {
+      if (active) {
+        dispatch({ type: "load-succeeded", snapshots });
+      }
+    });
     void window.aiUsageMonitor.readQuota().then(
       (snapshots) => {
         if (active) {
@@ -339,6 +344,7 @@ export function App() {
     );
     return () => {
       active = false;
+      unsubscribe();
     };
   }, []);
 

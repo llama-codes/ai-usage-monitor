@@ -22,7 +22,13 @@ function distanceToSegment(x, y, startX, startY, endX, endY) {
   );
 }
 
-function colorAt(x, y) {
+const stateArcColors = {
+  healthy: [14, 165, 233, 255],
+  warning: [245, 158, 11, 255],
+  critical: [244, 63, 94, 255],
+};
+
+function colorAt(x, y, arcColor) {
   const radius = Math.hypot(x, y);
   if (radius > 0.47) {
     return [0, 0, 0, 0];
@@ -36,7 +42,7 @@ function colorAt(x, y) {
   const degrees = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
   const inGaugeSweep = degrees >= 135 || degrees <= 45;
   if (radius >= 0.275 && radius <= 0.37 && inGaugeSweep) {
-    color = [14, 165, 233, 255];
+    color = arcColor;
   }
 
   if (distanceToSegment(x, y, 0, 0, 0.22, -0.22) <= 0.042) {
@@ -48,7 +54,7 @@ function colorAt(x, y) {
   return color;
 }
 
-function renderIcon(size) {
+function renderIcon(size, arcColor) {
   const highResolutionSize = size * supersampling;
   const highResolution = Buffer.alloc(
     highResolutionSize * highResolutionSize * 4,
@@ -58,7 +64,7 @@ function renderIcon(size) {
     for (let x = 0; x < highResolutionSize; x += 1) {
       const normalizedX = (x + 0.5) / highResolutionSize - 0.5;
       const normalizedY = (y + 0.5) / highResolutionSize - 0.5;
-      const color = colorAt(normalizedX, normalizedY);
+      const color = colorAt(normalizedX, normalizedY, arcColor);
       const offset = (y * highResolutionSize + x) * 4;
       for (let channel = 0; channel < 4; channel += 1) {
         highResolution[offset + channel] = color[channel];
@@ -117,13 +123,28 @@ function createIco(images) {
 }
 
 fs.mkdirSync(outputDirectory, { recursive: true });
-const images = ICON_SIZES.map((size) => {
-  const png = renderIcon(size);
+const stateImages = Object.fromEntries(
+  Object.entries(stateArcColors).map(([state, arcColor]) => [
+    state,
+    ICON_SIZES.map((size) => {
+      const png = renderIcon(size, arcColor);
+      fs.writeFileSync(
+        path.join(outputDirectory, `tray-${state}-${size}.png`),
+        png,
+      );
+      return { size, png };
+    }),
+  ]),
+);
+const healthyImages = stateImages.healthy;
+if (!healthyImages) {
+  throw new Error("Healthy tray images were not generated");
+}
+for (const { size, png } of healthyImages) {
   fs.writeFileSync(path.join(outputDirectory, `tray-${size}.png`), png);
-  return { size, png };
-});
-fs.writeFileSync(path.join(outputDirectory, "app.ico"), createIco(images));
+}
+fs.writeFileSync(path.join(outputDirectory, "app.ico"), createIco(healthyImages));
 
 process.stdout.write(
-  `Generated ${images.length} PNG representations and app.ico.\n`,
+  `Generated ${Object.keys(stateImages).length} tray states and app.ico.\n`,
 );

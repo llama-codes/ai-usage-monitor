@@ -32,15 +32,19 @@ export type ForceRefreshRequest = {
   reason: "user";
 };
 
+export type QuotaUpdateListener = (snapshots: QuotaSnapshot[]) => void;
+
 export type AIUsageMonitorAPI = {
   readQuota: () => Promise<QuotaSnapshot[]>;
   forceRefresh: (request: ForceRefreshRequest) => Promise<QuotaSnapshot[]>;
+  onQuotaUpdated: (listener: QuotaUpdateListener) => () => void;
   quit: () => Promise<void>;
 };
 
 export const IPC_CHANNELS = {
   readQuota: "quota:read",
   forceRefresh: "quota:force-refresh",
+  quotaUpdated: "quota:updated",
   quit: "app:quit",
 } as const;
 
