@@ -11,6 +11,8 @@
   "include": [
     "src/main/position.ts",
     "src/main/position.test.ts",
+    "src/main/providers/codex.ts",
+    "src/main/providers/codex.test.ts",
     "src/shared/contracts.ts",
     "src/shared/contracts.test.ts"
   ]

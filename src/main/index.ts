@@ -20,6 +20,7 @@ import {
   type QuotaSnapshot,
 } from "../shared/contracts";
 import { positionPopup } from "./position";
+import { CodexQuotaProvider } from "./providers/codex";
 
 const POPUP_SIZE = { width: 340, height: 420 };
 const SELF_TEST = process.argv.includes("--self-test");
@@ -39,6 +40,18 @@ const state: RuntimeState = {
 let popup: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
+const codexProvider = SELF_TEST
+  ? {
+      readQuota: async (): Promise<QuotaSnapshot> => ({
+        providerId: "codex",
+        connectionState: "not-connected",
+        windows: [],
+        capturedAt: Math.floor(Date.now() / 1_000),
+        error: "Codex provider is disabled during the Electron self-test.",
+      }),
+      dispose: () => undefined,
+    }
+  : new CodexQuotaProvider();
 
 const rendererPath = path.join(__dirname, "..", "renderer", "index.html");
 const rendererUrl = pathToFileURL(rendererPath).toString();
@@ -70,16 +83,10 @@ function log(event: string, details: Record<string, unknown> = {}): void {
   }
 }
 
-function createPlaceholderSnapshots(): QuotaSnapshot[] {
+async function readProviderSnapshots(): Promise<QuotaSnapshot[]> {
   const capturedAt = Math.floor(Date.now() / 1_000);
   const snapshots: QuotaSnapshot[] = [
-    {
-      providerId: "codex",
-      connectionState: "not-connected",
-      windows: [],
-      capturedAt,
-      error: "Provider integration is not implemented.",
-    },
+    await codexProvider.readQuota(),
     {
       providerId: "claude",
       connectionState: "not-connected",
@@ -107,15 +114,17 @@ function assertTrustedSender(event: IpcMainInvokeEvent): void {
   }
 }
 
-function readQuota(event: IpcMainInvokeEvent): QuotaSnapshot[] {
+async function readQuota(
+  event: IpcMainInvokeEvent,
+): Promise<QuotaSnapshot[]> {
   assertTrustedSender(event);
-  return createPlaceholderSnapshots();
+  return readProviderSnapshots();
 }
 
-function forceRefresh(
+async function forceRefresh(
   event: IpcMainInvokeEvent,
   payload: unknown,
-): QuotaSnapshot[] {
+): Promise<QuotaSnapshot[]> {
   assertTrustedSender(event);
   if (!isForceRefreshRequest(payload)) {
     throw new TypeError("Invalid forced-refresh request");
@@ -123,7 +132,7 @@ function forceRefresh(
 
   state.refreshes += 1;
   log("refresh", { refreshes: state.refreshes, reason: payload.reason });
-  return createPlaceholderSnapshots();
+  return readProviderSnapshots();
 }
 
 function hidePopup(reason: string): void {
@@ -254,10 +263,10 @@ function createPopup(): BrowserWindow {
   return window;
 }
 
-function requestRefreshFromTray(): void {
+async function requestRefreshFromTray(): Promise<void> {
   state.refreshes += 1;
   log("refresh", { refreshes: state.refreshes, reason: "tray-menu" });
-  createPlaceholderSnapshots();
+  await readProviderSnapshots();
 }
 
 function createTray(): Tray {
@@ -266,7 +275,7 @@ function createTray(): Tray {
   appTray.on("click", (_event, bounds) => togglePopup(bounds));
   appTray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "Refresh", click: requestRefreshFromTray },
+      { label: "Refresh", click: () => void requestRefreshFromTray() },
       { type: "separator" },
       {
         label: "Quit",
@@ -452,4 +461,5 @@ app.whenReady().then(async () => {
 
 app.on("before-quit", () => {
   quitting = true;
+  codexProvider.dispose();
 });

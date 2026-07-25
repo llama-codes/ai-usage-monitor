@@ -60,17 +60,19 @@ npm run smoke:packaged
 ```
 
 `spike:self-test` verifies the React renderer loads, Node globals are absent,
-the exposed API has exactly two frozen methods, typed read and forced-refresh
-IPC succeeds, the popup takes focus, 100 programmatic show/hide cycles succeed,
-and hidden background ticks continue. The positioning tests cover bottom, top,
-left, and right taskbars plus negative-coordinate/high-DPI work areas. Contract
-tests cover payload shape, percentages, Unix-second timestamps, and the `300`
-and `10080` duration IDs.
+the exposed API has exactly two frozen methods, deterministic typed read and
+forced-refresh IPC succeeds, the popup takes focus, 100 programmatic show/hide
+cycles succeed, and hidden background ticks continue. The self-test injects a
+Codex placeholder so it never depends on a local CLI or network response.
+The positioning tests cover bottom, top, left, and right taskbars plus
+negative-coordinate/high-DPI work areas. Contract tests cover payload shape,
+percentages, Unix-second timestamps, and the `300` and `10080` duration IDs.
 
-The placeholder snapshots report the planned Codex and Claude providers as
-`not-connected` with no windows and an implementation-pending error.
-`unsupported` is reserved for providers such as the planned OpenCode
-placeholder. No usage value is invented while provider adapters are absent.
+Normal app reads use the live Codex adapter described in
+`docs/codex-provider.md`. Claude remains `not-connected` with no windows and an
+implementation-pending error. `unsupported` is reserved for providers such as
+the planned OpenCode placeholder. No usage value is invented while an adapter
+is absent.
 
 Programmatic toggles establish state reliability, not an absence of visible
 flashing. A human must observe that criterion.
