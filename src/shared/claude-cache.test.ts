@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  CLAUDE_CACHE_RENAME_RETRY_DELAYS_MS,
   CLAUDE_CACHE_VERSION,
   parseClaudeQuotaCache,
   resolveClaudeCachePath,
@@ -93,25 +94,161 @@ test("atomic cache writes leave no temporary file", async () => {
   );
   const cachePath = path.join(directory, "cache.json");
   try {
-    await Promise.all([
-      writeClaudeQuotaCacheAtomically(cachePath, {
-        version: CLAUDE_CACHE_VERSION,
-        capturedAt: 100,
-        fiveHour: { usedPercent: 10, resetsAt: 200 },
-      }),
-      writeClaudeQuotaCacheAtomically(cachePath, {
-        version: CLAUDE_CACHE_VERSION,
-        capturedAt: 101,
-        sevenDay: { usedPercent: 20, resetsAt: 300 },
-      }),
+    const first = {
+      version: CLAUDE_CACHE_VERSION,
+      capturedAt: 100,
+      fiveHour: { usedPercent: 10, resetsAt: 200 },
+    } as const;
+    const second = {
+      version: CLAUDE_CACHE_VERSION,
+      capturedAt: 101,
+      sevenDay: { usedPercent: 20, resetsAt: 300 },
+    } as const;
+    const results = await Promise.allSettled([
+      writeClaudeQuotaCacheAtomically(cachePath, first),
+      writeClaudeQuotaCacheAtomically(cachePath, second),
     ]);
+    assert.deepEqual(
+      results.map((result) => result.status),
+      ["fulfilled", "fulfilled"],
+    );
     const parsed = parseClaudeQuotaCache(
       JSON.parse(await fs.promises.readFile(cachePath, "utf8")),
     );
     assert.ok(parsed);
-    assert.equal((await fs.promises.readdir(directory)).length, 1);
+    assert.ok(
+      JSON.stringify(parsed) === JSON.stringify(first) ||
+        JSON.stringify(parsed) === JSON.stringify(second),
+    );
+    assert.deepEqual(await fs.promises.readdir(directory), ["cache.json"]);
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retries bounded transient Windows replacement errors", async () => {
+  for (const code of ["EPERM", "EBUSY", "EACCES"]) {
+    const directory = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "aum-claude-retry-"),
+    );
+    const cachePath = path.join(directory, "cache.json");
+    const delays: number[] = [];
+    let renameCalls = 0;
+    try {
+      await writeClaudeQuotaCacheAtomically(
+        cachePath,
+        {
+          version: CLAUDE_CACHE_VERSION,
+          capturedAt: 100,
+          fiveHour: { usedPercent: 10, resetsAt: 200 },
+        },
+        {
+          platform: "win32",
+          rename: async (source, destination) => {
+            renameCalls += 1;
+            if (renameCalls <= 2) {
+              throw Object.assign(new Error(`injected ${code}`), { code });
+            }
+            await fs.promises.rename(source, destination);
+          },
+          delay: async (milliseconds) => {
+            delays.push(milliseconds);
+          },
+        },
+      );
+      assert.equal(renameCalls, 3);
+      assert.deepEqual(
+        delays,
+        CLAUDE_CACHE_RENAME_RETRY_DELAYS_MS.slice(0, 2),
+      );
+      assert.deepEqual(await fs.promises.readdir(directory), ["cache.json"]);
+    } finally {
+      await fs.promises.rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("permanent rename failure is surfaced and cleans its unique temp file", async () => {
+  const directory = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "aum-claude-permanent-"),
+  );
+  const cachePath = path.join(directory, "cache.json");
+  const injected = Object.assign(new Error("injected permanent rename failure"), {
+    code: "EPERM",
+  });
+  let renameCalls = 0;
+  try {
+    await assert.rejects(
+      writeClaudeQuotaCacheAtomically(
+        cachePath,
+        {
+          version: CLAUDE_CACHE_VERSION,
+          capturedAt: 100,
+          fiveHour: { usedPercent: 10, resetsAt: 200 },
+        },
+        {
+          platform: "win32",
+          rename: async () => {
+            renameCalls += 1;
+            throw injected;
+          },
+          delay: async () => undefined,
+          retryDelaysMs: [0, 0],
+        },
+      ),
+      (error: unknown) => error === injected,
+    );
+    assert.equal(renameCalls, 3);
+    assert.deepEqual(await fs.promises.readdir(directory), []);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not retry outside the narrow Windows transient-error policy", async () => {
+  for (const fixture of [
+    { platform: "linux" as const, code: "EPERM" },
+    { platform: "win32" as const, code: "EINVAL" },
+  ]) {
+    const directory = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "aum-claude-no-retry-"),
+    );
+    const cachePath = path.join(directory, "cache.json");
+    let renameCalls = 0;
+    let delayCalls = 0;
+    try {
+      await assert.rejects(
+        writeClaudeQuotaCacheAtomically(
+          cachePath,
+          {
+            version: CLAUDE_CACHE_VERSION,
+            capturedAt: 100,
+            fiveHour: { usedPercent: 10, resetsAt: 200 },
+          },
+          {
+            platform: fixture.platform,
+            rename: async () => {
+              renameCalls += 1;
+              throw Object.assign(new Error("injected non-retryable error"), {
+                code: fixture.code,
+              });
+            },
+            delay: async () => {
+              delayCalls += 1;
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof Error &&
+          "code" in error &&
+          error.code === fixture.code,
+      );
+      assert.equal(renameCalls, 1);
+      assert.equal(delayCalls, 0);
+      assert.deepEqual(await fs.promises.readdir(directory), []);
+    } finally {
+      await fs.promises.rm(directory, { recursive: true, force: true });
+    }
   }
 });
 

@@ -17,6 +17,7 @@ import {
   IPC_CHANNELS,
   isForceRefreshRequest,
   isQuotaSnapshot,
+  isQuitRequestArguments,
   type QuotaSnapshot,
 } from "../shared/contracts";
 import { positionPopup } from "./position";
@@ -31,11 +32,13 @@ const LOG_PATH = process.env.AUM_SPIKE_LOG;
 type RuntimeState = {
   backgroundTicks: number;
   refreshes: number;
+  rendererQuitRequests: number;
 };
 
 const state: RuntimeState = {
   backgroundTicks: 0,
   refreshes: 0,
+  rendererQuitRequests: 0,
 };
 
 let popup: BrowserWindow | null = null;
@@ -138,6 +141,25 @@ async function forceRefresh(
   state.refreshes += 1;
   log("refresh", { refreshes: state.refreshes, reason: payload.reason });
   return readProviderSnapshots();
+}
+
+async function quitFromRenderer(
+  event: IpcMainInvokeEvent,
+  ...payload: unknown[]
+): Promise<void> {
+  assertTrustedSender(event);
+  if (!isQuitRequestArguments(payload)) {
+    throw new TypeError("Invalid quit request");
+  }
+
+  state.rendererQuitRequests += 1;
+  log("quit-from-renderer", {
+    requests: state.rendererQuitRequests,
+  });
+  if (!SELF_TEST) {
+    quitting = true;
+    setImmediate(() => app.quit());
+  }
 }
 
 function hidePopup(reason: string): void {
@@ -328,7 +350,7 @@ async function verifyRendererBoundary(): Promise<void> {
     apiFrozen: boolean;
   };
 
-  const expectedKeys = ["forceRefresh", "readQuota"];
+  const expectedKeys = ["forceRefresh", "quit", "readQuota"];
   if (
     boundary.processType !== "undefined" ||
     boundary.requireType !== "undefined" ||
@@ -338,6 +360,53 @@ async function verifyRendererBoundary(): Promise<void> {
     throw new Error(`Renderer boundary failed: ${JSON.stringify(boundary)}`);
   }
   log("self-test-security-pass", boundary);
+}
+
+async function verifyPanelRendering(): Promise<void> {
+  if (!popup) {
+    throw new Error("Popup was not initialized");
+  }
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const panel = (await popup.webContents.executeJavaScript(`(() => {
+      const main = document.querySelector("main");
+      const buttons = [...document.querySelectorAll("button")];
+      return {
+        text: main?.textContent ?? "",
+        width: main?.getBoundingClientRect().width ?? 0,
+        height: main?.getBoundingClientRect().height ?? 0,
+        buttons: buttons.map((button) => button.textContent?.trim())
+      };
+    })()`)) as {
+      text: string;
+      width: number;
+      height: number;
+      buttons: Array<string | undefined>;
+    };
+    const expectedCopy = [
+      "AI Usage",
+      "Codex isn’t connected",
+      "Waiting for Claude Code",
+    ];
+    if (
+      panel.width === POPUP_SIZE.width &&
+      panel.height === POPUP_SIZE.height &&
+      expectedCopy.every((copy) => panel.text.includes(copy)) &&
+      !panel.text.includes("OpenCode") &&
+      panel.buttons.includes("Refresh") &&
+      panel.buttons.includes("Quit")
+    ) {
+      log("self-test-panel-pass", {
+        width: panel.width,
+        height: panel.height,
+        controls: panel.buttons,
+      });
+      return;
+    }
+    await delay(25);
+  }
+
+  throw new Error("Renderer panel did not reach the expected self-test state");
 }
 
 async function runSelfTest(): Promise<void> {
@@ -364,6 +433,7 @@ async function runSelfTest(): Promise<void> {
     throw new Error("Read request did not return placeholder snapshots");
   }
   log("self-test-read-pass", { snapshots: snapshots.length });
+  await verifyPanelRendering();
 
   await popup.webContents.executeJavaScript(
     'window.aiUsageMonitor.forceRefresh({ reason: "user" })',
@@ -412,6 +482,11 @@ async function runSelfTest(): Promise<void> {
     throw new Error(`Background timer only advanced ${tickDelta} ticks`);
   }
   log("self-test-background-pass", { tickDelta, hidden: !popup.isVisible() });
+  await popup.webContents.executeJavaScript("window.aiUsageMonitor.quit()");
+  if (state.rendererQuitRequests !== 1) {
+    throw new Error("Renderer quit request did not reach the validated handler");
+  }
+  log("self-test-quit-pass");
   log("self-test-pass", {
     skipTaskbarConfigured: true,
     popupFocusable: popup.isFocusable(),
@@ -422,6 +497,7 @@ async function runSelfTest(): Promise<void> {
 
 ipcMain.handle(IPC_CHANNELS.readQuota, readQuota);
 ipcMain.handle(IPC_CHANNELS.forceRefresh, forceRefresh);
+ipcMain.handle(IPC_CHANNELS.quit, quitFromRenderer);
 
 app.on("window-all-closed", () => {
   // A tray utility remains alive until its explicit Quit command.

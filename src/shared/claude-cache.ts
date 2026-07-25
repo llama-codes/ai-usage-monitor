@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 export const CLAUDE_CACHE_VERSION = 1;
 export const CLAUDE_CACHE_FILE = "claude-quota-v1.json";
 export const AI_USAGE_MONITOR_DATA_DIRECTORY = "AIUsageMonitor";
+export const CLAUDE_CACHE_RENAME_RETRY_DELAYS_MS = [5, 15, 30, 60] as const;
 
 export type ClaudeCacheWindow = {
   usedPercent: number;
@@ -16,6 +17,18 @@ export type ClaudeQuotaCache = {
   capturedAt: number;
   fiveHour?: ClaudeCacheWindow;
   sevenDay?: ClaudeCacheWindow;
+};
+
+type RenameCacheFile = (
+  temporaryPath: string,
+  cachePath: string,
+) => Promise<void>;
+
+export type ClaudeCacheAtomicWriteOptions = {
+  platform?: NodeJS.Platform;
+  rename?: RenameCacheFile;
+  delay?: (milliseconds: number) => Promise<void>;
+  retryDelaysMs?: readonly number[];
 };
 
 export function resolveAIUsageMonitorDataDirectory(
@@ -97,6 +110,7 @@ export function parseClaudeQuotaCache(value: unknown): ClaudeQuotaCache | null {
 export async function writeClaudeQuotaCacheAtomically(
   cachePath: string,
   cache: ClaudeQuotaCache,
+  options: ClaudeCacheAtomicWriteOptions = {},
 ): Promise<void> {
   const parsed = parseClaudeQuotaCache(cache);
   if (!parsed) {
@@ -115,11 +129,57 @@ export async function writeClaudeQuotaCacheAtomically(
       `${JSON.stringify(parsed)}\n`,
       { encoding: "utf8", flag: "wx", mode: 0o600 },
     );
-    await fs.promises.rename(temporaryPath, cachePath);
+    await renameCacheFileWithRetry(temporaryPath, cachePath, options);
   } catch (error) {
     await fs.promises.rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function renameCacheFileWithRetry(
+  temporaryPath: string,
+  cachePath: string,
+  options: ClaudeCacheAtomicWriteOptions,
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  const rename = options.rename ?? fs.promises.rename;
+  const delay = options.delay ?? wait;
+  const retryDelays =
+    options.retryDelaysMs ?? CLAUDE_CACHE_RENAME_RETRY_DELAYS_MS;
+  let retryIndex = 0;
+
+  while (true) {
+    try {
+      await rename(temporaryPath, cachePath);
+      return;
+    } catch (error) {
+      if (
+        platform !== "win32" ||
+        !isTransientWindowsRenameError(error) ||
+        retryIndex >= retryDelays.length
+      ) {
+        throw error;
+      }
+      const delayMilliseconds = retryDelays[retryIndex];
+      retryIndex += 1;
+      await delay(delayMilliseconds ?? 0);
+    }
+  }
+}
+
+function isTransientWindowsRenameError(error: unknown): boolean {
+  if (!isRecord(error) || typeof error.code !== "string") {
+    return false;
+  }
+  return (
+    error.code === "EPERM" ||
+    error.code === "EBUSY" ||
+    error.code === "EACCES"
+  );
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function parseCacheWindow(value: unknown): ClaudeCacheWindow | null {

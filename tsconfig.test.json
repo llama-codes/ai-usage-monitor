@@ -21,6 +21,8 @@
     "src/shared/claude-cache.test.ts",
     "src/shared/contracts.ts",
     "src/shared/contracts.test.ts",
+    "src/renderer/panel-model.ts",
+    "src/renderer/panel-model.test.ts",
     "scripts/statusline.ts"
   ]
 }

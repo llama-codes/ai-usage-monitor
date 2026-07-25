@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isForceRefreshRequest,
+  isQuitRequestArguments,
   isQuotaSnapshot,
   QUOTA_WINDOW_MINUTES,
   type QuotaSnapshot,
@@ -15,6 +16,12 @@ test("accepts the exact forced-refresh payload", () => {
     isForceRefreshRequest({ reason: "user", unexpected: true }),
     false,
   );
+});
+
+test("accepts only an exact no-payload quit request", () => {
+  assert.equal(isQuitRequestArguments([]), true);
+  assert.equal(isQuitRequestArguments([undefined]), false);
+  assert.equal(isQuitRequestArguments([{}]), false);
 });
 
 test("accepts valid quota snapshots and duration IDs", () => {

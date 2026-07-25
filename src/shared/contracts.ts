@@ -35,12 +35,18 @@ export type ForceRefreshRequest = {
 export type AIUsageMonitorAPI = {
   readQuota: () => Promise<QuotaSnapshot[]>;
   forceRefresh: (request: ForceRefreshRequest) => Promise<QuotaSnapshot[]>;
+  quit: () => Promise<void>;
 };
 
 export const IPC_CHANNELS = {
   readQuota: "quota:read",
   forceRefresh: "quota:force-refresh",
+  quit: "app:quit",
 } as const;
+
+export function isQuitRequestArguments(value: unknown[]): boolean {
+  return value.length === 0;
+}
 
 export function isForceRefreshRequest(
   value: unknown,
