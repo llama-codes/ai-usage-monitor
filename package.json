@@ -1,0 +1,21 @@
+{
+  "name": "ai-usage-monitor-tray-spike",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Windows system-tray acceptance spike for AI Usage Monitor",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/position.test.js",
+    "spike:self-test": "npm run build && node scripts/run-electron.js --self-test",
+    "spike:manual": "npm run build && node scripts/run-electron.js --manual-harness",
+    "package:win": "npm run build && electron-packager . AIUsageMonitorSpike --platform=win32 --arch=x64 --out=out --overwrite --prune=true --ignore=\"^/(src|scripts|docs|\\.spike|out)(/|$)\"",
+    "verify:packaged": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged.ps1"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.0.4",
+    "electron": "43.2.0",
+    "typescript": "7.0.2"
+  }
+}
