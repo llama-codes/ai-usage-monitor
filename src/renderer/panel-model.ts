@@ -1,5 +1,6 @@
 import {
   QUOTA_WINDOW_MINUTES,
+  type ClaudeSetupState,
   type QuotaSnapshot,
   type QuotaWindow,
 } from "../shared/contracts";
@@ -173,6 +174,86 @@ export type ProviderStatePresentation = {
   badge: string;
   error: boolean;
 };
+
+export type ClaudeSetupPresentation = {
+  heading: string;
+  body: string;
+  badge: string;
+  canInstall: boolean;
+  error: boolean;
+};
+
+export function canRenderClaudeQuota(
+  state: ClaudeSetupState | null,
+): boolean {
+  return state?.status === "available";
+}
+
+export function advanceClaudeSetupFromSnapshots(
+  state: ClaudeSetupState | null,
+  snapshots: QuotaSnapshot[],
+): ClaudeSetupState | null {
+  if (state?.status !== "installed-pending") {
+    return state;
+  }
+  return snapshots.some(
+    (snapshot) =>
+      snapshot.providerId === "claude" &&
+      snapshot.connectionState === "connected",
+  )
+    ? { status: "available" }
+    : state;
+}
+
+export function getClaudeSetupPresentation(
+  state: ClaudeSetupState,
+): ClaudeSetupPresentation {
+  switch (state.status) {
+    case "missing":
+      return {
+        heading: "Claude Code — Setup required",
+        body:
+          "Install the AI Usage Monitor hook to read Claude usage limits.",
+        badge: "Setup",
+        canInstall: true,
+        error: false,
+      };
+    case "installed-pending":
+      return {
+        heading: "Claude Code",
+        body:
+          "Open Claude Code CLI in a terminal, accept workspace trust if asked, then send one message and wait for its reply. Claude Desktop won't complete setup.",
+        badge: "CLI",
+        canInstall: false,
+        error: false,
+      };
+    case "conflict":
+      return {
+        heading: "Claude Code — Custom statusline found",
+        body:
+          "AI Usage Monitor won’t overwrite your existing statusline.",
+        badge: "Conflict",
+        canInstall: false,
+        error: false,
+      };
+    case "error":
+      return {
+        heading: "Claude Code setup failed",
+        body: state.message,
+        badge: "Error",
+        canInstall: true,
+        error: true,
+      };
+    case "available":
+      return {
+        heading: "Waiting for Claude Code",
+        body: "Restart or use Claude Code once to capture usage.",
+        badge: "No data",
+        canInstall: false,
+        error: false,
+      };
+  }
+}
 
 export function getProviderStatePresentation(
   snapshot: QuotaSnapshot,

@@ -22,7 +22,7 @@
     "verify:statusline": "npm run build:tools && node scripts/verify-statusline-cli.js",
     "spike:self-test": "npm run build && node scripts/run-electron.js --self-test",
     "spike:manual": "npm run build && node scripts/run-electron.js --manual-harness",
-    "package:win": "npm run icons:verify && npm run build && electron-packager . AIUsageMonitor --platform=win32 --arch=x64 --out=out --overwrite --prune=true --asar --icon=assets/icons/app.ico --ignore=\"^/(src|scripts|docs|fixtures|dist-test|\\.spike|out|tsconfig(?:\\..+)?\\.json|vite\\.config\\.ts)(/|$)\"",
+    "package:win": "npm run icons:verify && npm run build && electron-packager . AIUsageMonitor --platform=win32 --arch=x64 --out=out --overwrite --prune=true --asar --extra-resource=dist-tools --icon=assets/icons/app.ico --ignore=\"^/(src|scripts|docs|fixtures|dist-test|dist-tools|\\.spike|out|tsconfig(?:\\..+)?\\.json|vite\\.config\\.ts)(/|$)\"",
     "verify:packaged": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-packaged.ps1",
     "smoke:packaged": "node scripts/smoke-packaged.js"
   },

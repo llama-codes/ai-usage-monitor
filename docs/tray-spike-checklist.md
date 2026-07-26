@@ -40,9 +40,10 @@ checks reject blank artwork but cannot prove how the Windows shell composites
 an icon.
 
 The hardened renderer boundary keeps `contextIsolation: true`,
-`nodeIntegration: false`, and `sandbox: true`. The preload exposes only
-`readQuota` and `forceRefresh`; it never exposes `ipcRenderer`. Main validates
-the invoking frame and the exact forced-refresh payload.
+`nodeIntegration: false`, and `sandbox: true`. The preload exposes exactly
+`readQuota`, `forceRefresh`, `onQuotaUpdated`, `readClaudeSetup`,
+`installClaudeHook`, and `quit`; it never exposes `ipcRenderer`. Main validates
+the invoking frame and each exact command payload.
 
 ## Automated checks
 
@@ -60,19 +61,24 @@ npm run smoke:packaged
 ```
 
 `spike:self-test` verifies the React renderer loads, Node globals are absent,
-the exposed API has exactly two frozen methods, deterministic typed read and
-forced-refresh IPC succeeds, the popup takes focus, 100 programmatic show/hide
-cycles succeed, and hidden background ticks continue. The self-test injects a
-Codex placeholder so it never depends on a local CLI or network response.
+the exposed API has exactly six frozen methods (`readQuota`, `forceRefresh`,
+`onQuotaUpdated`, `readClaudeSetup`, `installClaudeHook`, and `quit`).
+Deterministic typed quota and Claude-setup IPC succeeds, the setup confirmation
+prevents an early settings write, isolated hook installation completes, the
+popup takes focus, 100 programmatic show/hide cycles succeed, and hidden
+background ticks continue.
+The self-test injects provider fixtures and temporary Claude settings so it
+never depends on a local CLI, network response, or live settings write.
 The positioning tests cover bottom, top, left, and right taskbars plus
 negative-coordinate/high-DPI work areas. Contract tests cover payload shape,
 percentages, Unix-second timestamps, and the `300` and `10080` duration IDs.
 
 Normal app reads use the live Codex adapter described in
-`docs/codex-provider.md`. Claude remains `not-connected` with no windows and an
-implementation-pending error. `unsupported` is reserved for providers such as
-the planned OpenCode placeholder. No usage value is invented while an adapter
-is absent.
+`docs/codex-provider.md` and the Claude adapter described in
+`docs/claude-provider.md`. Missing Claude setup is presented as an actionable
+setup card; installed setup with no cache asks for a Claude Code restart. No
+usage value is invented while a reading is absent. The generic `unsupported`
+contract remains available, but OpenCode is not rendered in the v1 panel.
 
 Programmatic toggles establish state reliability, not an absence of visible
 flashing. A human must observe that criterion.

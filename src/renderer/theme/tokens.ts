@@ -68,6 +68,11 @@ export const stateTokens = {
     "shrink-0 rounded-full border border-slate-700 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-400",
   staleBadge:
     "shrink-0 rounded-full border border-slate-600 bg-slate-800 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-300",
+  actions: "mt-2 flex items-center gap-1.5",
+  primaryAction:
+    "inline-flex h-7 items-center justify-center rounded-lg bg-orange-400 px-2.5 text-[11px] font-semibold text-slate-950 hover:bg-orange-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-200 disabled:cursor-wait disabled:opacity-60",
+  secondaryAction:
+    "inline-flex h-7 items-center justify-center rounded-lg border border-slate-700 px-2.5 text-[11px] font-medium text-slate-300 hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400 disabled:cursor-wait disabled:opacity-60",
 } as const;
 
 export const controlTokens = {

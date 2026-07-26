@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isForceRefreshRequest,
+  isInstallClaudeHookRequest,
   isQuitRequestArguments,
   isQuotaSnapshot,
   QUOTA_WINDOW_MINUTES,
@@ -22,6 +23,16 @@ test("accepts only an exact no-payload quit request", () => {
   assert.equal(isQuitRequestArguments([]), true);
   assert.equal(isQuitRequestArguments([undefined]), false);
   assert.equal(isQuitRequestArguments([{}]), false);
+});
+
+test("accepts only an explicitly confirmed Claude hook install", () => {
+  assert.equal(isInstallClaudeHookRequest({ confirmed: true }), true);
+  assert.equal(isInstallClaudeHookRequest({}), false);
+  assert.equal(isInstallClaudeHookRequest({ confirmed: false }), false);
+  assert.equal(
+    isInstallClaudeHookRequest({ confirmed: true, unexpected: true }),
+    false,
+  );
 });
 
 test("accepts valid quota snapshots and duration IDs", () => {

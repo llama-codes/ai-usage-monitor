@@ -99,10 +99,41 @@ dist-tools/
         └── claude-cache.js
 ```
 
-Packaging these files inside `app.asar` is build evidence only; it is not a
-deployable statusline command. Before live activation, Step 8 must copy or
-extract the complete compiled layout into an app-owned real-filesystem
-directory and pass that external `statusline.js` path to the installer.
+The packaged app ships this layout as an Electron extra resource outside
+`app.asar`. After the user confirms installation in the panel, the app copies
+the two runtime files into this versioned real-filesystem directory:
+
+```text
+%LOCALAPPDATA%\AIUsageMonitor\claude-hook\v1\
+```
+
+Deployment uses a unique sibling staging directory followed by a directory
+rename. The app compares both deployed files byte-for-byte with the packaged
+source. An identical v1 deployment is reused; a partial or stale regular
+deployment is displaced only after a complete staging layout is verified.
+Failed replacement restores the displaced directory. Symlinked or junction
+roots and layout files are rejected rather than followed. Only after
+deployment succeeds does the app pass the external `statusline.js` path to the
+existing safe installer.
+
+## In-app onboarding
+
+With no cache and no configured hook, the Claude card says
+`Claude Code — Setup required` and offers `Install hook`. The first click only
+shows an in-panel confirmation explaining that `settings.json` will be backed
+up and updated. The settings write occurs only after `Confirm install`.
+
+After installation the card tells the user to open the Claude Code CLI in a
+terminal, accept workspace trust if prompted, send one message, and wait for
+the response. Claude Desktop does not run this Claude Code statusline and
+therefore cannot complete setup. Polling continues, and the card changes to
+quota gauges when the first valid cache arrives. An existing foreign or custom
+`statusLine` is reported as a conflict and is never overwritten. Read,
+deployment, and installer failures show safe retry guidance.
+
+The Electron self-test exercises this confirmation and installation flow with
+isolated temporary settings and data paths. It never targets the live Claude
+settings file.
 
 The CLI intentionally requires both paths:
 

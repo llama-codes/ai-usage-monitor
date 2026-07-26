@@ -32,12 +32,27 @@ export type ForceRefreshRequest = {
   reason: "user";
 };
 
+export type InstallClaudeHookRequest = {
+  confirmed: true;
+};
+
+export type ClaudeSetupState =
+  | { status: "available" }
+  | { status: "missing" }
+  | { status: "installed-pending" }
+  | { status: "conflict" }
+  | { status: "error"; message: string };
+
 export type QuotaUpdateListener = (snapshots: QuotaSnapshot[]) => void;
 
 export type AIUsageMonitorAPI = {
   readQuota: () => Promise<QuotaSnapshot[]>;
   forceRefresh: (request: ForceRefreshRequest) => Promise<QuotaSnapshot[]>;
   onQuotaUpdated: (listener: QuotaUpdateListener) => () => void;
+  readClaudeSetup: () => Promise<ClaudeSetupState>;
+  installClaudeHook: (
+    request: InstallClaudeHookRequest,
+  ) => Promise<ClaudeSetupState>;
   quit: () => Promise<void>;
 };
 
@@ -45,6 +60,8 @@ export const IPC_CHANNELS = {
   readQuota: "quota:read",
   forceRefresh: "quota:force-refresh",
   quotaUpdated: "quota:updated",
+  readClaudeSetup: "claude-setup:read",
+  installClaudeHook: "claude-setup:install",
   quit: "app:quit",
 } as const;
 
@@ -63,6 +80,17 @@ export function isForceRefreshRequest(
     Object.keys(value).length === 1 &&
     Object.hasOwn(value, "reason") &&
     value.reason === "user"
+  );
+}
+
+export function isInstallClaudeHookRequest(
+  value: unknown,
+): value is InstallClaudeHookRequest {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 1 &&
+    Object.hasOwn(value, "confirmed") &&
+    value.confirmed === true
   );
 }
 

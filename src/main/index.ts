@@ -13,14 +13,17 @@ import {
   type Rectangle,
 } from "electron";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   IPC_CHANNELS,
   isForceRefreshRequest,
+  isInstallClaudeHookRequest,
   isQuotaSnapshot,
   isQuitRequestArguments,
   type QuotaSnapshot,
+  type ClaudeSetupState,
 } from "../shared/contracts";
 import { positionPopup } from "./position";
 import {
@@ -35,6 +38,12 @@ import { BackgroundTaskScheduler } from "./background-task";
 import { retainNotification } from "./notification-lifetime";
 import { ClaudeQuotaProvider } from "./providers/claude";
 import { CodexQuotaProvider } from "./providers/codex";
+import {
+  inspectClaudeSetup,
+  installClaudeHook,
+  resolveDeployedStatusLinePath,
+  type ClaudeHookPaths,
+} from "./providers/claude-onboarding";
 
 const POPUP_SIZE = { width: 340, height: 420 };
 const SELF_TEST = process.argv.includes("--self-test");
@@ -51,6 +60,7 @@ type RuntimeState = {
   pollRefreshes: number;
   resumeRefreshes: number;
   trayRecreations: number;
+  claudeHookInstalls: number;
 };
 
 const state: RuntimeState = {
@@ -63,6 +73,7 @@ const state: RuntimeState = {
   pollRefreshes: 0,
   resumeRefreshes: 0,
   trayRecreations: 0,
+  claudeHookInstalls: 0,
 };
 
 let popup: BrowserWindow | null = null;
@@ -73,6 +84,7 @@ let refreshInFlight: Promise<QuotaSnapshot[]> | null = null;
 let pollTimer: NodeJS.Timeout | undefined;
 let trayWatchdogTimer: NodeJS.Timeout | undefined;
 let selfTestHeartbeatTimer: NodeJS.Timeout | undefined;
+let selfTestOnboardingRoot: string | undefined;
 const monitorPolicy = new QuotaMonitorPolicy();
 const selfTestNotificationActivations: Array<() => void> = [];
 const activeNotifications = new Set<Notification>();
@@ -116,6 +128,14 @@ const providerReaders: ProviderReader[] = [
   { providerId: "codex", readQuota: () => codexProvider.readQuota() },
   { providerId: "claude", readQuota: () => claudeProvider.readQuota() },
 ];
+
+function cleanupSelfTestOnboarding(): void {
+  if (!selfTestOnboardingRoot) {
+    return;
+  }
+  fs.rmSync(selfTestOnboardingRoot, { recursive: true, force: true });
+  selfTestOnboardingRoot = undefined;
+}
 
 let cachedSnapshots = createInitialSnapshots();
 
@@ -314,6 +334,106 @@ async function forceRefresh(
   }
 
   return refreshMonitor(payload.reason);
+}
+
+function getClaudeHookPaths(): ClaudeHookPaths {
+  if (SELF_TEST) {
+    if (!selfTestOnboardingRoot) {
+      throw new Error("Claude self-test onboarding paths are unavailable");
+    }
+    const sourceBase = app.isPackaged
+      ? process.resourcesPath
+      : app.getAppPath();
+    const destinationBase = path.join(selfTestOnboardingRoot, "local");
+    return {
+      settingsPath: path.join(
+        selfTestOnboardingRoot,
+        ".claude",
+        "settings.json",
+      ),
+      sourceBase,
+      sourceRoot: path.join(sourceBase, "dist-tools"),
+      destinationBase,
+      destinationRoot: path.join(
+        destinationBase,
+        "AIUsageMonitor",
+        "claude-hook",
+        "v1",
+      ),
+    };
+  }
+
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData || !path.isAbsolute(localAppData)) {
+    throw new Error("Local AppData is unavailable");
+  }
+  const sourceBase = app.isPackaged
+    ? process.resourcesPath
+    : app.getAppPath();
+  return {
+    settingsPath: path.join(app.getPath("home"), ".claude", "settings.json"),
+    sourceBase,
+    sourceRoot: path.join(sourceBase, "dist-tools"),
+    destinationBase: localAppData,
+    destinationRoot: path.join(
+      localAppData,
+      "AIUsageMonitor",
+      "claude-hook",
+      "v1",
+    ),
+  };
+}
+
+function claudeCacheIsAvailable(): boolean {
+  return cachedSnapshots.some(
+    (snapshot) =>
+      snapshot.providerId === "claude" &&
+      snapshot.connectionState === "connected",
+  );
+}
+
+async function readClaudeSetup(
+  event: IpcMainInvokeEvent,
+  ...payload: unknown[]
+): Promise<ClaudeSetupState> {
+  assertTrustedSender(event);
+  if (!isQuitRequestArguments(payload)) {
+    throw new TypeError("Invalid Claude setup read request");
+  }
+  try {
+    const paths = getClaudeHookPaths();
+    return await inspectClaudeSetup({
+      settingsPath: paths.settingsPath,
+      deployedStatusLinePath: resolveDeployedStatusLinePath(
+        paths.destinationRoot,
+      ),
+      cacheAvailable: claudeCacheIsAvailable(),
+    });
+  } catch {
+    return {
+      status: "error",
+      message: "Claude setup could not be checked. Try again.",
+    };
+  }
+}
+
+async function installClaudeHookFromRenderer(
+  event: IpcMainInvokeEvent,
+  payload: unknown,
+): Promise<ClaudeSetupState> {
+  assertTrustedSender(event);
+  if (!isInstallClaudeHookRequest(payload)) {
+    throw new TypeError("Invalid Claude hook install request");
+  }
+  state.claudeHookInstalls += 1;
+  try {
+    return await installClaudeHook({ paths: getClaudeHookPaths() });
+  } catch {
+    return {
+      status: "error",
+      message: "Claude setup could not be installed. Try again.",
+    };
+  }
 }
 
 async function quitFromRenderer(
@@ -676,8 +796,10 @@ async function verifyRendererBoundary(): Promise<void> {
 
   const expectedKeys = [
     "forceRefresh",
+    "installClaudeHook",
     "onQuotaUpdated",
     "quit",
+    "readClaudeSetup",
     "readQuota",
   ];
   if (
@@ -715,7 +837,7 @@ async function verifyPanelRendering(): Promise<void> {
     const expectedCopy = [
       "AI Usage",
       "Codex isn’t connected",
-      "Waiting for Claude Code",
+      "Claude Code — Setup required",
     ];
     if (
       panel.width === POPUP_SIZE.width &&
@@ -777,6 +899,76 @@ async function runSelfTest(): Promise<void> {
     providerReads: state.providerReads,
   });
   await verifyPanelRendering();
+
+  const installButtonClicked =
+    (await popup.webContents.executeJavaScript(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find((candidate) => candidate.textContent?.trim() === "Install hook");
+      button?.click();
+      return Boolean(button);
+    })()`)) as boolean;
+  await delay(25);
+  const confirmationShown =
+    (await popup.webContents.executeJavaScript(
+      `document.querySelector("main")?.textContent?.includes(
+        "This will back up and update Claude’s settings.json. Continue?"
+      ) ?? false`,
+    )) as boolean;
+  if (
+    !installButtonClicked ||
+    !confirmationShown ||
+    state.claudeHookInstalls !== 0
+  ) {
+    throw new Error("Claude hook confirmation boundary failed");
+  }
+  log("self-test-claude-confirmation-pass");
+
+  const confirmClicked =
+    (await popup.webContents.executeJavaScript(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find((candidate) => candidate.textContent?.trim() === "Confirm install");
+      button?.click();
+      return Boolean(button);
+    })()`)) as boolean;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const pending =
+      (await popup.webContents.executeJavaScript(
+        `document.querySelector("main")?.textContent?.includes(
+          "Open Claude Code CLI in a terminal"
+        ) ?? false`,
+      )) as boolean;
+    if (pending) {
+      break;
+    }
+    await delay(25);
+  }
+  const postInstallText =
+    (await popup.webContents.executeJavaScript(
+      `document.querySelector("main")?.textContent ?? ""`,
+    )) as string;
+  if (
+    !confirmClicked ||
+    Number(state.claudeHookInstalls) !== 1 ||
+    !postInstallText.includes("send one message and wait for its reply") ||
+    !postInstallText.includes("Claude Desktop won't complete setup.")
+  ) {
+    throw new Error("Claude hook isolated installation failed");
+  }
+  log("self-test-claude-install-pass", {
+    isolated: true,
+    installs: state.claudeHookInstalls,
+  });
+
+  const invalidInstallRejected =
+    (await popup.webContents.executeJavaScript(
+      `window.aiUsageMonitor
+        .installClaudeHook({ confirmed: false })
+        .then(() => false, () => true)`,
+    )) as boolean;
+  if (!invalidInstallRejected || Number(state.claudeHookInstalls) !== 1) {
+    throw new Error("Invalid Claude hook install payload was not rejected");
+  }
+  log("self-test-invalid-claude-install-pass");
 
   const invalidListenerRejected =
     (await popup.webContents.executeJavaScript(`(() => {
@@ -921,6 +1113,8 @@ async function runSelfTest(): Promise<void> {
 
 ipcMain.handle(IPC_CHANNELS.readQuota, readQuota);
 ipcMain.handle(IPC_CHANNELS.forceRefresh, forceRefresh);
+ipcMain.handle(IPC_CHANNELS.readClaudeSetup, readClaudeSetup);
+ipcMain.handle(IPC_CHANNELS.installClaudeHook, installClaudeHookFromRenderer);
 ipcMain.handle(IPC_CHANNELS.quit, quitFromRenderer);
 
 app.on("window-all-closed", () => {
@@ -928,6 +1122,20 @@ app.on("window-all-closed", () => {
 });
 
 app.whenReady().then(async () => {
+  if (SELF_TEST) {
+    selfTestOnboardingRoot = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "aum-electron-onboarding-"),
+    );
+    const selfTestSettingsPath = path.join(
+      selfTestOnboardingRoot,
+      ".claude",
+      "settings.json",
+    );
+    await fs.promises.mkdir(path.dirname(selfTestSettingsPath), {
+      recursive: true,
+    });
+    await fs.promises.writeFile(selfTestSettingsPath, "{\n}\n", "utf8");
+  }
   popup = createPopup();
   tray = createTray("startup");
   powerMonitor.on("resume", handleSystemResume);
@@ -947,6 +1155,7 @@ app.whenReady().then(async () => {
           : {}),
       });
       quitting = true;
+      cleanupSelfTestOnboarding();
       app.exit(1);
     }
   } else {
@@ -978,4 +1187,5 @@ app.on("before-quit", () => {
   }
   activeNotifications.clear();
   codexProvider.dispose();
+  cleanupSelfTestOnboarding();
 });

@@ -203,6 +203,10 @@ export function insertTopLevelStatusLine(
   );
 }
 
+export function parseClaudeSettingsJsonc(input: string): unknown {
+  return JSON.parse(normalizeJsonc(input));
+}
+
 function normalizeJsonc(input: string): string {
   const characters = input.split("");
   let inString = false;

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   AIUsageMonitorAPI,
+  InstallClaudeHookRequest,
   ForceRefreshRequest,
   ProviderConnectionState,
   QuotaSnapshot,
@@ -14,6 +15,8 @@ const IPC_CHANNELS = {
   readQuota: "quota:read",
   forceRefresh: "quota:force-refresh",
   quotaUpdated: "quota:updated",
+  readClaudeSetup: "claude-setup:read",
+  installClaudeHook: "claude-setup:install",
   quit: "app:quit",
 } as const satisfies typeof import("../shared/contracts").IPC_CHANNELS;
 
@@ -100,6 +103,9 @@ const api: AIUsageMonitorAPI = {
     return () =>
       ipcRenderer.removeListener(IPC_CHANNELS.quotaUpdated, handler);
   },
+  readClaudeSetup: () => ipcRenderer.invoke(IPC_CHANNELS.readClaudeSetup),
+  installClaudeHook: (request: InstallClaudeHookRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.installClaudeHook, request),
   quit: () => ipcRenderer.invoke(IPC_CHANNELS.quit),
 };
 

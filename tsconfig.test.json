@@ -23,6 +23,8 @@
     "src/main/providers/claude.test.ts",
     "src/main/providers/claude-installer.ts",
     "src/main/providers/claude-installer.test.ts",
+    "src/main/providers/claude-onboarding.ts",
+    "src/main/providers/claude-onboarding.test.ts",
     "src/shared/claude-cache.ts",
     "src/shared/claude-cache.test.ts",
     "src/shared/contracts.ts",

@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   describeProviderState,
+  advanceClaudeSetupFromSnapshots,
+  canRenderClaudeQuota,
   formatCountdown,
   formatReadingAge,
   getProviderStatePresentation,
+  getClaudeSetupPresentation,
   getSeverity,
   initialPanelState,
   isClaudeSnapshotStale,
@@ -12,6 +15,76 @@ import {
   reducePanelState,
   toRemainingPercent,
 } from "./panel-model";
+
+test("derives Claude setup, pending, conflict, and retry presentation", () => {
+  assert.equal(canRenderClaudeQuota(null), false);
+  assert.equal(canRenderClaudeQuota({ status: "missing" }), false);
+  assert.equal(canRenderClaudeQuota({ status: "conflict" }), false);
+  assert.equal(canRenderClaudeQuota({ status: "available" }), true);
+  assert.deepEqual(getClaudeSetupPresentation({ status: "missing" }), {
+    heading: "Claude Code — Setup required",
+    body: "Install the AI Usage Monitor hook to read Claude usage limits.",
+    badge: "Setup",
+    canInstall: true,
+    error: false,
+  });
+  assert.equal(
+    getClaudeSetupPresentation({ status: "installed-pending" }).body,
+    "Open Claude Code CLI in a terminal, accept workspace trust if asked, then send one message and wait for its reply. Claude Desktop won't complete setup.",
+  );
+  assert.equal(
+    getClaudeSetupPresentation({ status: "installed-pending" }).badge,
+    "CLI",
+  );
+  assert.equal(
+    getClaudeSetupPresentation({ status: "conflict" }).canInstall,
+    false,
+  );
+  assert.deepEqual(
+    getClaudeSetupPresentation({
+      status: "error",
+      message: "Safe failure.",
+    }),
+    {
+      heading: "Claude Code setup failed",
+      body: "Safe failure.",
+      badge: "Error",
+      canInstall: true,
+      error: true,
+    },
+  );
+});
+
+test("only an owned pending setup advances when connected Claude data arrives", () => {
+  const connectedClaude = [
+    { ...snapshot(), providerId: "claude", connectionState: "connected" as const },
+  ];
+  assert.deepEqual(
+    advanceClaudeSetupFromSnapshots(
+      { status: "installed-pending" },
+      connectedClaude,
+    ),
+    { status: "available" },
+  );
+  for (const setup of [
+    null,
+    { status: "missing" } as const,
+    { status: "conflict" } as const,
+    { status: "error", message: "Safe error." } as const,
+  ]) {
+    assert.equal(
+      advanceClaudeSetupFromSnapshots(setup, connectedClaude),
+      setup,
+    );
+  }
+  assert.deepEqual(
+    advanceClaudeSetupFromSnapshots(
+      { status: "installed-pending" },
+      [{ ...snapshot(), providerId: "claude", connectionState: "no-data-yet" }],
+    ),
+    { status: "installed-pending" },
+  );
+});
 import {
   QUOTA_WINDOW_MINUTES,
   type ProviderConnectionState,

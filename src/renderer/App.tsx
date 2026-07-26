@@ -1,10 +1,17 @@
 import { useEffect, useReducer, useState } from "react";
-import type { QuotaSnapshot, QuotaWindow } from "../shared/contracts";
+import type {
+  ClaudeSetupState,
+  QuotaSnapshot,
+  QuotaWindow,
+} from "../shared/contracts";
 import {
+  advanceClaudeSetupFromSnapshots,
+  canRenderClaudeQuota,
   describeProviderState,
   formatCountdown,
   formatReadingAge,
   getProviderName,
+  getClaudeSetupPresentation,
   getProviderStatePresentation,
   getSeverity,
   getWindowLabel,
@@ -248,6 +255,104 @@ function ProviderStateCard({ snapshot }: { snapshot: QuotaSnapshot }) {
   );
 }
 
+function ClaudeSetupCard({
+  setup,
+  onInstall,
+}: {
+  setup: ClaudeSetupState;
+  onInstall: () => Promise<void>;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const presentation = getClaudeSetupPresentation(setup);
+
+  async function confirmInstall(): Promise<void> {
+    setInstalling(true);
+    try {
+      await onInstall();
+      setConfirming(false);
+    } finally {
+      setInstalling(false);
+    }
+  }
+
+  return (
+    <section
+      aria-labelledby="claude-setup-heading"
+      className={
+        presentation.error ? stateTokens.errorCard : stateTokens.card
+      }
+    >
+      <div className={stateTokens.headingRow}>
+        <h2
+          className={
+            presentation.error
+              ? stateTokens.errorHeading
+              : stateTokens.heading
+          }
+          id="claude-setup-heading"
+        >
+          {presentation.heading}
+        </h2>
+        <span className={stateTokens.badge}>{presentation.badge}</span>
+      </div>
+      <p
+        aria-live="polite"
+        className={
+          presentation.error ? stateTokens.errorBody : stateTokens.body
+        }
+      >
+        {confirming
+          ? "This will back up and update Claude’s settings.json. Continue?"
+          : presentation.body}
+      </p>
+      {presentation.canInstall ? (
+        <div className={stateTokens.actions}>
+          {confirming ? (
+            <>
+              <button
+                className={stateTokens.primaryAction}
+                disabled={installing}
+                onClick={() => void confirmInstall()}
+                type="button"
+              >
+                {installing ? "Installing…" : "Confirm install"}
+              </button>
+              <button
+                className={stateTokens.secondaryAction}
+                disabled={installing}
+                onClick={() => setConfirming(false)}
+                type="button"
+              >
+                Cancel
+              </button>
+            </>
+          ) : (
+            <button
+              className={stateTokens.primaryAction}
+              onClick={() => setConfirming(true)}
+              type="button"
+            >
+              {setup.status === "error" ? "Retry setup" : "Install hook"}
+            </button>
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ClaudeSetupCheckingCard() {
+  return (
+    <section aria-live="polite" className={stateTokens.card} role="status">
+      <h2 className={stateTokens.heading}>Checking Claude Code setup…</h2>
+      <p className={stateTokens.body}>
+        Verifying the installed statusline hook.
+      </p>
+    </section>
+  );
+}
+
 function MissingProviderCard({ providerId }: { providerId: string }) {
   const name = getProviderName(providerId);
   return (
@@ -268,13 +373,30 @@ function MissingProviderCard({ providerId }: { providerId: string }) {
 function ProviderSection({
   providerId,
   snapshots,
+  claudeSetup,
+  onInstallClaudeHook,
 }: {
   providerId: string;
   snapshots: QuotaSnapshot[];
+  claudeSetup: ClaudeSetupState | null;
+  onInstallClaudeHook: () => Promise<void>;
 }) {
   const snapshot = snapshots.find((item) => item.providerId === providerId);
   if (!snapshot) {
     return <MissingProviderCard providerId={providerId} />;
+  }
+  if (providerId === "claude") {
+    if (!claudeSetup) {
+      return <ClaudeSetupCheckingCard />;
+    }
+    if (!canRenderClaudeQuota(claudeSetup)) {
+      return (
+        <ClaudeSetupCard
+          onInstall={onInstallClaudeHook}
+          setup={claudeSetup}
+        />
+      );
+    }
   }
   return snapshot.connectionState === "connected" ? (
     <ConnectedProviderCard snapshot={snapshot} />
@@ -319,18 +441,26 @@ export function App() {
     reducePanelState,
     initialPanelState,
   );
+  const [claudeSetup, setClaudeSetup] =
+    useState<ClaudeSetupState | null>(null);
 
   useEffect(() => {
     let active = true;
     const unsubscribe = window.aiUsageMonitor.onQuotaUpdated((snapshots) => {
       if (active) {
         dispatch({ type: "load-succeeded", snapshots });
+        setClaudeSetup((setup) =>
+          advanceClaudeSetupFromSnapshots(setup, snapshots),
+        );
       }
     });
     void window.aiUsageMonitor.readQuota().then(
       (snapshots) => {
         if (active) {
           dispatch({ type: "load-succeeded", snapshots });
+          setClaudeSetup((setup) =>
+            advanceClaudeSetupFromSnapshots(setup, snapshots),
+          );
         }
       },
       (error: unknown) => {
@@ -338,6 +468,21 @@ export function App() {
           dispatch({
             type: "load-failed",
             message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+    );
+    void window.aiUsageMonitor.readClaudeSetup().then(
+      (setup) => {
+        if (active) {
+          setClaudeSetup(setup);
+        }
+      },
+      () => {
+        if (active) {
+          setClaudeSetup({
+            status: "error",
+            message: "Claude setup could not be checked. Try again.",
           });
         }
       },
@@ -355,10 +500,27 @@ export function App() {
         reason: "user",
       });
       dispatch({ type: "refresh-succeeded", snapshots });
+      setClaudeSetup((setup) =>
+        advanceClaudeSetupFromSnapshots(setup, snapshots),
+      );
     } catch (error) {
       dispatch({
         type: "refresh-failed",
         message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async function installClaudeHook(): Promise<void> {
+    try {
+      const setup = await window.aiUsageMonitor.installClaudeHook({
+        confirmed: true,
+      });
+      setClaudeSetup(setup);
+    } catch {
+      setClaudeSetup({
+        status: "error",
+        message: "Claude setup could not be installed. Try again.",
       });
     }
   }
@@ -396,10 +558,14 @@ export function App() {
             <ProviderSection
               providerId="codex"
               snapshots={panelState.snapshots}
+              claudeSetup={claudeSetup}
+              onInstallClaudeHook={installClaudeHook}
             />
             <ProviderSection
               providerId="claude"
               snapshots={panelState.snapshots}
+              claudeSetup={claudeSetup}
+              onInstallClaudeHook={installClaudeHook}
             />
           </>
         ) : null}
