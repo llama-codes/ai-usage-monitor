@@ -163,7 +163,22 @@ test("orders five-hour before weekly and naturally omits absent windows", () => 
   assert.deepEqual(orderQuotaWindows([]), []);
 });
 
-test("formats countdowns before and across reset without negatives", () => {
+test("formats countdown day boundaries and never renders negatives", () => {
+  assert.deepEqual(formatCountdown(NOW + 86_399, NOW), {
+    due: false,
+    label: "Resets in 23h 59m",
+  });
+  assert.deepEqual(formatCountdown(NOW + 86_400, NOW), {
+    due: false,
+    label: "Resets in 1d 0h 0m",
+  });
+  assert.deepEqual(
+    formatCountdown(NOW + 5 * 86_400 + 21 * 3_600 + 17 * 60, NOW),
+    {
+      due: false,
+      label: "Resets in 5d 21h 17m",
+    },
+  );
   assert.deepEqual(formatCountdown(NOW + 7_261, NOW), {
     due: false,
     label: "Resets in 2h 1m",
@@ -173,6 +188,10 @@ test("formats countdowns before and across reset without negatives", () => {
     label: "Resets in 1m 1s",
   });
   assert.deepEqual(formatCountdown(NOW, NOW + 1), {
+    due: true,
+    label: "Reset due · Refresh to update",
+  });
+  assert.deepEqual(formatCountdown(NOW, NOW), {
     due: true,
     label: "Reset due · Refresh to update",
   });

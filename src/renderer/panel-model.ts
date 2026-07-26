@@ -126,9 +126,16 @@ export function formatCountdown(
     return { due: true, label: "Reset due · Refresh to update" };
   }
 
-  const hours = Math.floor(remaining / 3_600);
+  const days = Math.floor(remaining / 86_400);
+  const hours = Math.floor((remaining % 86_400) / 3_600);
   const minutes = Math.floor((remaining % 3_600) / 60);
   const seconds = remaining % 60;
+  if (days > 0) {
+    return {
+      due: false,
+      label: `Resets in ${days}d ${hours}h ${minutes}m`,
+    };
+  }
   if (hours > 0) {
     return { due: false, label: `Resets in ${hours}h ${minutes}m` };
   }
