@@ -822,20 +822,38 @@ async function verifyPanelRendering(): Promise<void> {
     const panel = (await popup.webContents.executeJavaScript(`(() => {
       const main = document.querySelector("main");
       const buttons = [...document.querySelectorAll("button")];
+      const control = (label) => {
+        const button = buttons.find(
+          (candidate) => candidate.textContent?.trim() === label
+        );
+        const bounds = button?.getBoundingClientRect();
+        return {
+          present: Boolean(button),
+          focusable:
+            Boolean(button) &&
+            !button.disabled &&
+            button.tabIndex >= 0 &&
+            Boolean(bounds && bounds.width > 0 && bounds.height > 0)
+        };
+      };
       return {
         text: main?.textContent ?? "",
         width: main?.getBoundingClientRect().width ?? 0,
         height: main?.getBoundingClientRect().height ?? 0,
-        buttons: buttons.map((button) => button.textContent?.trim())
+        buttons: buttons.map((button) => button.textContent?.trim()),
+        refresh: control("Refresh"),
+        quit: control("Quit")
       };
     })()`)) as {
       text: string;
       width: number;
       height: number;
       buttons: Array<string | undefined>;
+      refresh: { present: boolean; focusable: boolean };
+      quit: { present: boolean; focusable: boolean };
     };
     const expectedCopy = [
-      "AI Usage",
+      "AI QUOTA",
       "Codex isn’t connected",
       "Claude Code — Setup required",
     ];
@@ -845,7 +863,11 @@ async function verifyPanelRendering(): Promise<void> {
       expectedCopy.every((copy) => panel.text.includes(copy)) &&
       !panel.text.includes("OpenCode") &&
       panel.buttons.includes("Refresh") &&
-      panel.buttons.includes("Quit")
+      panel.buttons.includes("Quit") &&
+      panel.refresh.present &&
+      panel.refresh.focusable &&
+      panel.quit.present &&
+      panel.quit.focusable
     ) {
       log("self-test-panel-pass", {
         width: panel.width,
@@ -858,6 +880,140 @@ async function verifyPanelRendering(): Promise<void> {
   }
 
   throw new Error("Renderer panel did not reach the expected self-test state");
+}
+
+async function waitForPanelCopy(expectedCopy: string): Promise<void> {
+  if (!popup) {
+    throw new Error("Popup was not initialized");
+  }
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const text = (await popup.webContents.executeJavaScript(
+      'document.querySelector("main")?.textContent ?? ""',
+    )) as string;
+    if (text.includes(expectedCopy)) {
+      return;
+    }
+    await delay(25);
+  }
+  throw new Error(`Renderer did not show expected copy: ${expectedCopy}`);
+}
+
+async function reloadSelfTestRenderer(): Promise<void> {
+  if (!popup) {
+    throw new Error("Popup was not initialized");
+  }
+  const loaded = new Promise<void>((resolve) => {
+    popup?.webContents.once("did-finish-load", () => resolve());
+  });
+  popup.webContents.reload();
+  await loaded;
+}
+
+async function verifyConnectedPanelRendering(): Promise<void> {
+  if (!popup) {
+    throw new Error("Popup was not initialized");
+  }
+  const capturedAt = nowSeconds();
+  const connectedFixture: QuotaSnapshot[] = [
+    {
+      providerId: "codex",
+      connectionState: "connected",
+      capturedAt,
+      windows: [
+        {
+          label: "Five hours",
+          usedPercent: 42,
+          windowMinutes: 300,
+          resetsAt: capturedAt + 3_600,
+        },
+        {
+          label: "Weekly",
+          usedPercent: 91,
+          windowMinutes: 10_080,
+          resetsAt: capturedAt + 604_800,
+        },
+      ],
+    },
+    cachedSnapshots.find((snapshot) => snapshot.providerId === "claude") ??
+      createProviderErrorSnapshot("claude"),
+  ];
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, connectedFixture);
+
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const panel = (await popup.webContents.executeJavaScript(`(() => {
+      const content = document.querySelector("[data-panel-content]");
+      const meters = [...document.querySelectorAll('[role="meter"]')];
+      const labels = meters.map((meter) => meter.getAttribute("aria-label") ?? "");
+      const buttons = [...document.querySelectorAll("button")];
+      const focusableControl = (label) => {
+        const button = buttons.find(
+          (candidate) => candidate.textContent?.trim() === label
+        );
+        const bounds = button?.getBoundingClientRect();
+        return Boolean(
+          button &&
+          !button.disabled &&
+          button.tabIndex >= 0 &&
+          bounds &&
+          bounds.width > 0 &&
+          bounds.height > 0
+        );
+      };
+      return {
+        labels,
+        noVerticalOverflow:
+          Boolean(content) && content.scrollHeight <= content.clientHeight + 1,
+        refreshFocusable: focusableControl("Refresh"),
+        quitFocusable: focusableControl("Quit")
+      };
+    })()`)) as {
+      labels: string[];
+      noVerticalOverflow: boolean;
+      refreshFocusable: boolean;
+      quitFocusable: boolean;
+    };
+    if (
+      panel.labels.length === 2 &&
+      panel.labels.some((label) => label.startsWith("5-hour:")) &&
+      panel.labels.some((label) => label.startsWith("Weekly:")) &&
+      panel.noVerticalOverflow &&
+      panel.refreshFocusable &&
+      panel.quitFocusable
+    ) {
+      log("self-test-connected-panel-pass", {
+        windows: panel.labels,
+        noVerticalOverflow: panel.noVerticalOverflow,
+        controlsFocusable: true,
+      });
+      return;
+    }
+    await delay(25);
+  }
+  throw new Error(
+    "Connected two-window panel did not render without vertical overflow",
+  );
+}
+
+async function verifyClaudeSetupStatesRendering(): Promise<void> {
+  const settingsPath = getClaudeHookPaths().settingsPath;
+  await fs.promises.writeFile(
+    settingsPath,
+    '{\n  "statusLine": { "type": "command", "command": "echo custom" }\n}\n',
+    "utf8",
+  );
+  await reloadSelfTestRenderer();
+  await waitForPanelCopy("Claude Code — Custom statusline found");
+
+  await fs.promises.writeFile(settingsPath, "{\n", "utf8");
+  await reloadSelfTestRenderer();
+  await waitForPanelCopy("Claude Code setup failed");
+
+  await fs.promises.writeFile(settingsPath, "{\n}\n", "utf8");
+  await reloadSelfTestRenderer();
+  await waitForPanelCopy("Claude Code — Setup required");
+  log("self-test-claude-state-rendering-pass", {
+    states: ["setup", "conflict", "error"],
+  });
 }
 
 async function runSelfTest(): Promise<void> {
@@ -899,6 +1055,8 @@ async function runSelfTest(): Promise<void> {
     providerReads: state.providerReads,
   });
   await verifyPanelRendering();
+  await verifyConnectedPanelRendering();
+  await verifyClaudeSetupStatesRendering();
 
   const installButtonClicked =
     (await popup.webContents.executeJavaScript(`(() => {

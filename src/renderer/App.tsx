@@ -10,6 +10,8 @@ import {
   describeProviderState,
   formatCountdown,
   formatReadingAge,
+  getConnectedProviderSeverity,
+  getPanelSummaryPresentation,
   getProviderName,
   getClaudeSetupPresentation,
   getProviderStatePresentation,
@@ -20,6 +22,8 @@ import {
   orderQuotaWindows,
   reducePanelState,
   toRemainingPercent,
+  type GaugeSeverity,
+  type PresentationTone,
 } from "./panel-model";
 import {
   controlTokens,
@@ -27,7 +31,9 @@ import {
   panelTokens,
   providerTokens,
   severityTokens,
+  statusBadgeTokens,
   stateTokens,
+  summaryTokens,
 } from "./theme/tokens";
 
 function currentUnixSeconds(): number {
@@ -122,6 +128,82 @@ function ProviderMark({ providerId }: { providerId: string }) {
   );
 }
 
+function severityLabel(severity: GaugeSeverity | "no-data"): string {
+  if (severity === "critical") {
+    return "Critical";
+  }
+  if (severity === "warning") {
+    return "Warning";
+  }
+  if (severity === "stale") {
+    return "Stale";
+  }
+  if (severity === "no-data") {
+    return "Reset due";
+  }
+  return "Healthy";
+}
+
+function summaryCardClass(tone: PresentationTone): string {
+  if (tone === "critical" || tone === "error") {
+    return tone === "critical"
+      ? summaryTokens.criticalCard
+      : summaryTokens.errorCard;
+  }
+  if (tone === "warning" || tone === "offline") {
+    return summaryTokens.warningCard;
+  }
+  if (tone === "stale" || tone === "no-data") {
+    return summaryTokens.staleCard;
+  }
+  return summaryTokens.card;
+}
+
+function summaryValueClass(tone: PresentationTone): string {
+  if (tone === "critical" || tone === "error") {
+    return summaryTokens.valueCritical;
+  }
+  if (tone === "warning" || tone === "offline") {
+    return summaryTokens.valueWarning;
+  }
+  if (tone === "stale" || tone === "no-data") {
+    return summaryTokens.valueStale;
+  }
+  return summaryTokens.value;
+}
+
+function PanelSummary({
+  snapshots,
+  nowSeconds,
+}: {
+  snapshots: QuotaSnapshot[];
+  nowSeconds: number;
+}) {
+  const summary = getPanelSummaryPresentation(snapshots, nowSeconds);
+  return (
+    <section
+      aria-labelledby="quota-summary-heading"
+      className={summaryCardClass(summary.tone)}
+    >
+      <div className={summaryTokens.top}>
+        <h2 className={summaryTokens.eyebrow} id="quota-summary-heading">
+          {summary.eyebrow}
+        </h2>
+        <span className={statusBadgeTokens[summary.tone]}>
+          {summary.badge}
+        </span>
+      </div>
+      <div className={summaryTokens.metric}>
+        <span className={summaryValueClass(summary.tone)}>
+          {summary.value}
+        </span>
+        <span className={summaryTokens.label}>{summary.label}</span>
+      </div>
+      <p className={summaryTokens.detail}>{summary.detail}</p>
+    </section>
+  );
+}
+
 function Gauge({
   quotaWindow,
   nowSeconds,
@@ -172,11 +254,17 @@ function Gauge({
   );
 }
 
-function ConnectedProviderCard({ snapshot }: { snapshot: QuotaSnapshot }) {
-  const nowSeconds = useNowSeconds();
+function ConnectedProviderCard({
+  snapshot,
+  nowSeconds,
+}: {
+  snapshot: QuotaSnapshot;
+  nowSeconds: number;
+}) {
   const stale = isClaudeSnapshotStale(snapshot, nowSeconds);
   const windows = orderQuotaWindows(snapshot.windows);
   const name = getProviderName(snapshot.providerId);
+  const severity = getConnectedProviderSeverity(snapshot, nowSeconds);
 
   return (
     <section
@@ -196,9 +284,14 @@ function ConnectedProviderCard({ snapshot }: { snapshot: QuotaSnapshot }) {
             <span className={stateTokens.staleBadge}>Stale</span>
           ) : null}
         </div>
-        <span className={providerTokens.age}>
-          {formatReadingAge(snapshot.capturedAt, nowSeconds)}
-        </span>
+        <div className={providerTokens.status}>
+          <span className={statusBadgeTokens[severity]}>
+            {severityLabel(severity)}
+          </span>
+          <span className={providerTokens.age}>
+            {formatReadingAge(snapshot.capturedAt, nowSeconds)}
+          </span>
+        </div>
       </div>
       {windows.length > 0 ? (
         <div className={providerTokens.gaugeStack}>
@@ -220,6 +313,12 @@ function ConnectedProviderCard({ snapshot }: { snapshot: QuotaSnapshot }) {
 
 function ProviderStateCard({ snapshot }: { snapshot: QuotaSnapshot }) {
   const presentation = getProviderStatePresentation(snapshot);
+  const badgeTone =
+    snapshot.connectionState === "error"
+      ? "error"
+      : snapshot.connectionState === "not-connected"
+        ? "offline"
+        : "no-data";
 
   return (
     <section
@@ -242,7 +341,9 @@ function ProviderStateCard({ snapshot }: { snapshot: QuotaSnapshot }) {
         >
           {presentation.heading}
         </h2>
-        <span className={stateTokens.badge}>{presentation.badge}</span>
+        <span className={statusBadgeTokens[badgeTone]}>
+          {presentation.badge}
+        </span>
       </div>
       <p
         className={
@@ -265,6 +366,14 @@ function ClaudeSetupCard({
   const [confirming, setConfirming] = useState(false);
   const [installing, setInstalling] = useState(false);
   const presentation = getClaudeSetupPresentation(setup);
+  const badgeTone =
+    setup.status === "error"
+      ? "error"
+      : setup.status === "installed-pending" ||
+          setup.status === "missing" ||
+          setup.status === "conflict"
+        ? "warning"
+        : "no-data";
 
   async function confirmInstall(): Promise<void> {
     setInstalling(true);
@@ -294,7 +403,9 @@ function ClaudeSetupCard({
         >
           {presentation.heading}
         </h2>
-        <span className={stateTokens.badge}>{presentation.badge}</span>
+        <span className={statusBadgeTokens[badgeTone]}>
+          {presentation.badge}
+        </span>
       </div>
       <p
         aria-live="polite"
@@ -373,11 +484,13 @@ function MissingProviderCard({ providerId }: { providerId: string }) {
 function ProviderSection({
   providerId,
   snapshots,
+  nowSeconds,
   claudeSetup,
   onInstallClaudeHook,
 }: {
   providerId: string;
   snapshots: QuotaSnapshot[];
+  nowSeconds: number;
   claudeSetup: ClaudeSetupState | null;
   onInstallClaudeHook: () => Promise<void>;
 }) {
@@ -399,7 +512,7 @@ function ProviderSection({
     }
   }
   return snapshot.connectionState === "connected" ? (
-    <ConnectedProviderCard snapshot={snapshot} />
+    <ConnectedProviderCard nowSeconds={nowSeconds} snapshot={snapshot} />
   ) : (
     <ProviderStateCard snapshot={snapshot} />
   );
@@ -443,6 +556,7 @@ export function App() {
   );
   const [claudeSetup, setClaudeSetup] =
     useState<ClaudeSetupState | null>(null);
+  const nowSeconds = useNowSeconds();
 
   useEffect(() => {
     let active = true;
@@ -540,12 +654,13 @@ export function App() {
           <DialIcon className={panelTokens.headerMarkIcon} />
         </span>
         <div className={panelTokens.headerText}>
-          <h1 className={panelTokens.title}>AI Usage</h1>
-          <p className={panelTokens.subtitle}>Quota remaining</p>
+          <h1 className={panelTokens.title}>AI QUOTA</h1>
+          <p className={panelTokens.subtitle}>Current readings</p>
         </div>
+        <span className={panelTokens.headerStatus}>Provider readings</span>
       </header>
 
-      <div className={panelTokens.content}>
+      <div className={panelTokens.content} data-panel-content="">
         {panelState.initialLoading ? <LoadingState /> : null}
         {panelState.error && panelState.snapshots.length === 0 ? (
           <PanelFailure message={panelState.error} />
@@ -555,15 +670,21 @@ export function App() {
         ) : null}
         {!panelState.initialLoading && panelState.snapshots.length > 0 ? (
           <>
+            <PanelSummary
+              nowSeconds={nowSeconds}
+              snapshots={panelState.snapshots}
+            />
             <ProviderSection
               providerId="codex"
               snapshots={panelState.snapshots}
+              nowSeconds={nowSeconds}
               claudeSetup={claudeSetup}
               onInstallClaudeHook={installClaudeHook}
             />
             <ProviderSection
               providerId="claude"
               snapshots={panelState.snapshots}
+              nowSeconds={nowSeconds}
               claudeSetup={claudeSetup}
               onInstallClaudeHook={installClaudeHook}
             />

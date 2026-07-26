@@ -6,6 +6,8 @@ import {
   canRenderClaudeQuota,
   formatCountdown,
   formatReadingAge,
+  getConnectedProviderSeverity,
+  getPanelSummaryPresentation,
   getProviderStatePresentation,
   getClaudeSetupPresentation,
   getSeverity,
@@ -136,6 +138,127 @@ test("selects all connected threshold rows including exhausted", () => {
   assert.equal(getSeverity(90), "critical");
   assert.equal(getSeverity(100), "critical");
   assert.equal(toRemainingPercent(100), 0);
+});
+
+test("summarizes the lowest trustworthy current quota without forecasting", () => {
+  const codex = {
+    ...snapshot(),
+    providerId: "codex",
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 42,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: NOW + 7_200,
+      },
+      {
+        label: "Weekly",
+        usedPercent: 91,
+        windowMinutes: QUOTA_WINDOW_MINUTES.weekly,
+        resetsAt: NOW + 5 * 86_400,
+      },
+    ],
+  };
+  assert.deepEqual(getPanelSummaryPresentation([snapshot(), codex], NOW), {
+    eyebrow: "CURRENT RISK",
+    value: "9%",
+    label: "lowest quota remaining",
+    detail: "Codex · Weekly · Resets in 5d 0h 0m",
+    badge: "Critical",
+    tone: "critical",
+  });
+  assert.equal(getConnectedProviderSeverity(codex, NOW), "critical");
+});
+
+test("excludes reset-due and expired windows from current risk", () => {
+  const codex = {
+    ...snapshot(),
+    providerId: "codex",
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 100,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: NOW,
+      },
+      {
+        label: "Weekly",
+        usedPercent: 82,
+        windowMinutes: QUOTA_WINDOW_MINUTES.weekly,
+        resetsAt: NOW + 1,
+      },
+    ],
+  };
+
+  assert.equal(getConnectedProviderSeverity(codex, NOW), "warning");
+  assert.deepEqual(getPanelSummaryPresentation([codex], NOW), {
+    eyebrow: "CURRENT RISK",
+    value: "18%",
+    label: "lowest quota remaining",
+    detail: "Codex · Weekly · Resets in 1s",
+    badge: "Warning",
+    tone: "warning",
+  });
+
+  const resetDue = {
+    ...codex,
+    windows: codex.windows.map((window) => ({
+      ...window,
+      resetsAt: NOW,
+    })),
+  };
+  assert.equal(getConnectedProviderSeverity(resetDue, NOW), "no-data");
+  assert.deepEqual(getPanelSummaryPresentation([resetDue], NOW), {
+    eyebrow: "CURRENT STATUS",
+    value: "—",
+    label: "quota reset due",
+    detail: "Refresh to request the provider’s current quota.",
+    badge: "Reset due",
+    tone: "no-data",
+  });
+
+  const expired = {
+    ...resetDue,
+    windows: resetDue.windows.map((window) => ({
+      ...window,
+      resetsAt: NOW - 1,
+    })),
+  };
+  assert.equal(getConnectedProviderSeverity(expired, NOW), "no-data");
+  assert.equal(
+    getPanelSummaryPresentation([expired], NOW).badge,
+    "Reset due",
+  );
+});
+
+test("summarizes stale, error, offline, and no-data states explicitly", () => {
+  assert.deepEqual(
+    getPanelSummaryPresentation([snapshot()], NOW + 301),
+    {
+      eyebrow: "CURRENT STATUS",
+      value: "—",
+      label: "fresh quota unavailable",
+      detail: "Claude Code reading is older than 5 minutes.",
+      badge: "Stale",
+      tone: "stale",
+    },
+  );
+  assert.equal(
+    getPanelSummaryPresentation([snapshot("error")], NOW).tone,
+    "error",
+  );
+  assert.equal(
+    getPanelSummaryPresentation([snapshot("not-connected")], NOW).tone,
+    "offline",
+  );
+  assert.equal(
+    getPanelSummaryPresentation([snapshot("no-data-yet")], NOW).tone,
+    "no-data",
+  );
+  assert.equal(
+    getConnectedProviderSeverity(snapshot(), NOW + 301),
+    "stale",
+  );
 });
 
 test("derives stale Claude readings after five minutes and neutralizes them", () => {

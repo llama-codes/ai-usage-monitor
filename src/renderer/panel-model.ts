@@ -8,6 +8,11 @@ import {
 export const CLAUDE_STALE_AFTER_SECONDS = 5 * 60;
 
 export type GaugeSeverity = "healthy" | "warning" | "critical" | "stale";
+export type PresentationTone =
+  | GaugeSeverity
+  | "offline"
+  | "no-data"
+  | "error";
 
 export type PanelState = {
   initialLoading: boolean;
@@ -83,6 +88,28 @@ export function getSeverity(
     return "warning";
   }
   return "healthy";
+}
+
+export function getConnectedProviderSeverity(
+  snapshot: QuotaSnapshot,
+  nowSeconds: number,
+): GaugeSeverity | "no-data" {
+  if (isClaudeSnapshotStale(snapshot, nowSeconds)) {
+    return "stale";
+  }
+  let worstUsedPercent: number | undefined;
+  for (const window of snapshot.windows) {
+    if (window.resetsAt <= nowSeconds) {
+      continue;
+    }
+    worstUsedPercent =
+      worstUsedPercent === undefined
+        ? window.usedPercent
+        : Math.max(worstUsedPercent, window.usedPercent);
+  }
+  return worstUsedPercent === undefined
+    ? "no-data"
+    : getSeverity(worstUsedPercent);
 }
 
 export function isClaudeSnapshotStale(
@@ -173,6 +200,131 @@ export function getProviderName(providerId: string): string {
     return "OpenCode";
   }
   return providerId;
+}
+
+export type PanelSummaryPresentation = {
+  eyebrow: string;
+  value: string;
+  label: string;
+  detail: string;
+  badge: string;
+  tone: PresentationTone;
+};
+
+export function getPanelSummaryPresentation(
+  snapshots: QuotaSnapshot[],
+  nowSeconds: number,
+): PanelSummaryPresentation {
+  let lowest:
+    | {
+        snapshot: QuotaSnapshot;
+        window: QuotaWindow;
+        remainingPercent: number;
+      }
+    | undefined;
+
+  for (const snapshot of snapshots) {
+    if (
+      snapshot.connectionState !== "connected" ||
+      isClaudeSnapshotStale(snapshot, nowSeconds)
+    ) {
+      continue;
+    }
+    for (const window of snapshot.windows) {
+      if (window.resetsAt <= nowSeconds) {
+        continue;
+      }
+      const remainingPercent = toRemainingPercent(window.usedPercent);
+      if (!lowest || remainingPercent < lowest.remainingPercent) {
+        lowest = { snapshot, window, remainingPercent };
+      }
+    }
+  }
+
+  if (lowest) {
+    const tone = getSeverity(lowest.window.usedPercent);
+    return {
+      eyebrow: "CURRENT RISK",
+      value: `${lowest.remainingPercent}%`,
+      label: "lowest quota remaining",
+      detail: `${getProviderName(lowest.snapshot.providerId)} · ${getWindowLabel(lowest.window.windowMinutes)} · ${formatCountdown(lowest.window.resetsAt, nowSeconds).label}`,
+      badge:
+        tone === "critical"
+          ? "Critical"
+          : tone === "warning"
+            ? "Warning"
+            : "Healthy",
+      tone,
+    };
+  }
+
+  if (
+    snapshots.some((snapshot) =>
+      isClaudeSnapshotStale(snapshot, nowSeconds),
+    )
+  ) {
+    return {
+      eyebrow: "CURRENT STATUS",
+      value: "—",
+      label: "fresh quota unavailable",
+      detail: "Claude Code reading is older than 5 minutes.",
+      badge: "Stale",
+      tone: "stale",
+    };
+  }
+
+  if (
+    snapshots.some(
+      (snapshot) =>
+        snapshot.connectionState === "connected" &&
+        snapshot.windows.length > 0 &&
+        snapshot.windows.every((window) => window.resetsAt <= nowSeconds),
+    )
+  ) {
+    return {
+      eyebrow: "CURRENT STATUS",
+      value: "—",
+      label: "quota reset due",
+      detail: "Refresh to request the provider’s current quota.",
+      badge: "Reset due",
+      tone: "no-data",
+    };
+  }
+
+  if (snapshots.some((snapshot) => snapshot.connectionState === "error")) {
+    return {
+      eyebrow: "CURRENT STATUS",
+      value: "—",
+      label: "usage unavailable",
+      detail: "A provider refresh failed. Check the details below.",
+      badge: "Error",
+      tone: "error",
+    };
+  }
+
+  if (
+    snapshots.some(
+      (snapshot) => snapshot.connectionState === "not-connected",
+    )
+  ) {
+    return {
+      eyebrow: "CURRENT STATUS",
+      value: "—",
+      label: "provider offline",
+      detail: "Connect a provider, then refresh its reading.",
+      badge: "Offline",
+      tone: "offline",
+    };
+  }
+
+  return {
+    eyebrow: "CURRENT STATUS",
+    value: "—",
+    label: "waiting for quota data",
+    detail: "Complete setup or wait for the first provider reading.",
+    badge: "No data",
+    tone: "no-data",
+  };
 }
 
 export type ProviderStatePresentation = {
