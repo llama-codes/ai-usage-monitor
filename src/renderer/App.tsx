@@ -3,6 +3,7 @@ import type {
   ClaudeSetupState,
   QuotaForecast,
   QuotaSnapshot,
+  QuotaTrend,
   QuotaWindow,
 } from "../shared/contracts";
 import {
@@ -14,6 +15,7 @@ import {
   formatReadingAge,
   getConnectedProviderSeverity,
   getPanelSummaryPresentation,
+  getQuotaTrendGraphPresentation,
   getProviderName,
   getClaudeSetupPresentation,
   getProviderStatePresentation,
@@ -27,6 +29,7 @@ import {
   type GaugeSeverity,
   type PresentationTone,
 } from "./panel-model";
+import { QuotaTrendGraph } from "./QuotaTrendGraph";
 import {
   controlTokens,
   gaugeTokens,
@@ -176,32 +179,54 @@ function summaryValueClass(tone: PresentationTone): string {
 
 function PanelSummary({
   snapshots,
+  forecasts,
+  trends,
   nowSeconds,
+  generatedAt,
 }: {
   snapshots: QuotaSnapshot[];
+  forecasts: QuotaForecast[];
+  trends: QuotaTrend[];
   nowSeconds: number;
+  generatedAt: number;
 }) {
-  const summary = getPanelSummaryPresentation(snapshots, nowSeconds);
+  const summary = getPanelSummaryPresentation(
+    snapshots,
+    nowSeconds,
+    generatedAt,
+  );
+  const trend = getQuotaTrendGraphPresentation(
+    snapshots,
+    forecasts,
+    trends,
+    nowSeconds,
+    generatedAt,
+  );
   return (
     <section
       aria-labelledby="quota-summary-heading"
       className={summaryCardClass(summary.tone)}
     >
-      <div className={summaryTokens.top}>
-        <h2 className={summaryTokens.eyebrow} id="quota-summary-heading">
-          {summary.eyebrow}
-        </h2>
-        <span className={statusBadgeTokens[summary.tone]}>
-          {summary.badge}
-        </span>
+      <div className={summaryTokens.body}>
+        <div className={summaryTokens.copy}>
+          <div className={summaryTokens.top}>
+            <h2 className={summaryTokens.eyebrow} id="quota-summary-heading">
+              {summary.eyebrow}
+            </h2>
+            <span className={statusBadgeTokens[summary.tone]}>
+              {summary.badge}
+            </span>
+          </div>
+          <div className={summaryTokens.metric}>
+            <span className={summaryValueClass(summary.tone)}>
+              {summary.value}
+            </span>
+            <span className={summaryTokens.label}>{summary.label}</span>
+          </div>
+          <p className={summaryTokens.detail}>{summary.detail}</p>
+        </div>
+        <QuotaTrendGraph presentation={trend} />
       </div>
-      <div className={summaryTokens.metric}>
-        <span className={summaryValueClass(summary.tone)}>
-          {summary.value}
-        </span>
-        <span className={summaryTokens.label}>{summary.label}</span>
-      </div>
-      <p className={summaryTokens.detail}>{summary.detail}</p>
     </section>
   );
 }
@@ -699,8 +724,11 @@ export function App() {
         {!panelState.initialLoading && panelState.snapshots.length > 0 ? (
           <>
             <PanelSummary
+              forecasts={panelState.forecasts}
+              generatedAt={panelState.generatedAt}
               nowSeconds={nowSeconds}
               snapshots={panelState.snapshots}
+              trends={panelState.trends}
             />
             <ProviderSection
               providerId="codex"

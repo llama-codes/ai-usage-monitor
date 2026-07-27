@@ -9,6 +9,7 @@ import {
   formatReadingAge,
   getConnectedProviderSeverity,
   getPanelSummaryPresentation,
+  getQuotaTrendGraphPresentation,
   getProviderStatePresentation,
   getClaudeSetupPresentation,
   getSeverity,
@@ -18,7 +19,7 @@ import {
   reducePanelState,
   toRemainingPercent,
 } from "./panel-model";
-import type { QuotaForecast } from "../shared/contracts";
+import type { QuotaForecast, QuotaSnapshot } from "../shared/contracts";
 
 test("derives Claude setup, pending, conflict, and retry presentation", () => {
   assert.equal(canRenderClaudeQuota(null), false);
@@ -92,7 +93,6 @@ test("only an owned pending setup advances when connected Claude data arrives", 
 import {
   QUOTA_WINDOW_MINUTES,
   type ProviderConnectionState,
-  type QuotaSnapshot,
 } from "../shared/contracts";
 
 const NOW = 1_800_000_000;
@@ -424,6 +424,332 @@ test("formats every forecast state truthfully and localizes projected time", () 
   );
 });
 
+test("builds truthful actual and allowed forecast paths for only current risk", () => {
+  const risk: QuotaSnapshot = {
+    providerId: "codex",
+    connectionState: "connected",
+    capturedAt: NOW,
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 90,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: NOW + 10_000,
+      },
+    ],
+  };
+  const evidence = {
+    sampleCount: 10,
+    distinctCaptureCount: 10,
+    spanSeconds: 3_600,
+    increasePercent: 10,
+  };
+  const trend = {
+    providerId: "codex",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 10_000,
+    points: [
+      { capturedAt: NOW - 3_600, usedPercent: 70 },
+      { capturedAt: NOW, usedPercent: 90 },
+    ],
+  };
+  const projected: QuotaForecast = {
+    providerId: "codex",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 10_000,
+    state: "projected-runout",
+    confidence: "high",
+    calculatedAt: NOW,
+    evidenceStartAt: NOW - 3_600,
+    evidenceEndAt: NOW,
+    projectedRunoutAt: NOW + 5_000,
+    evidence,
+  };
+  const graph = getQuotaTrendGraphPresentation(
+    [snapshot(), risk],
+    [projected],
+    [trend],
+    NOW,
+  );
+  assert.match(graph.actualPath, /^M4 \d+(?:\.\d)? L/);
+  assert.match(graph.projectionPath, /^M.+ L.+ 48$/);
+  assert.equal(graph.projectionKind, "forecast");
+  assert.equal(graph.pointCount, 2);
+  assert.equal(graph.currentRemaining, 10);
+  assert.match(
+    graph.ariaLabel,
+    /Codex 5-hour usage trend\. 2 actual points\. 10% remaining\./,
+  );
+
+  for (const state of [
+    "insufficient",
+    "safe-through-reset",
+    "unavailable-error",
+  ] as const) {
+    const forecast: QuotaForecast =
+      state === "safe-through-reset"
+        ? {
+            providerId: projected.providerId,
+            windowMinutes: projected.windowMinutes,
+            resetsAt: projected.resetsAt,
+            state,
+            confidence: projected.confidence,
+            calculatedAt: projected.calculatedAt,
+            evidenceStartAt: projected.evidenceStartAt,
+            evidenceEndAt: projected.evidenceEndAt,
+            evidence: projected.evidence,
+          }
+        : {
+            providerId: "codex",
+            windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+            resetsAt: NOW + 10_000,
+            state,
+            evidence:
+              state === "insufficient"
+                ? evidence
+                : {
+                    sampleCount: 0,
+                    distinctCaptureCount: 0,
+                    spanSeconds: 0,
+                    increasePercent: 0,
+                  },
+          };
+    assert.equal(
+      getQuotaTrendGraphPresentation([risk], [forecast], [trend], NOW)
+        .projectionKind,
+      "none",
+    );
+  }
+  const exhausted: QuotaForecast = {
+    providerId: "codex",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 10_000,
+    state: "exhausted",
+    calculatedAt: NOW,
+    evidence: {
+      sampleCount: 0,
+      distinctCaptureCount: 0,
+      spanSeconds: 0,
+      increasePercent: 0,
+    },
+  };
+  assert.equal(
+    getQuotaTrendGraphPresentation(
+      [
+        {
+          ...risk,
+          windows: [{ ...risk.windows[0]!, usedPercent: 100 }],
+        },
+      ],
+      [exhausted],
+      [trend],
+      NOW,
+    ).projectionKind,
+    "none",
+  );
+});
+
+test("shows stale retained estimates and honest collecting placeholders", () => {
+  const staleCapturedAt = NOW - 600;
+  const stale: QuotaSnapshot = {
+    providerId: "claude",
+    connectionState: "connected",
+    capturedAt: staleCapturedAt,
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 80,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: NOW + 10_000,
+      },
+    ],
+  };
+  const evidence = {
+    sampleCount: 10,
+    distinctCaptureCount: 10,
+    spanSeconds: 3_600,
+    increasePercent: 10,
+  };
+  const paused: QuotaForecast = {
+    providerId: "claude",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 10_000,
+    state: "stale-paused",
+    evidence: {
+      sampleCount: 0,
+      distinctCaptureCount: 0,
+      spanSeconds: 0,
+      increasePercent: 0,
+    },
+    retainedEstimate: {
+      state: "projected-runout",
+      confidence: "high",
+      calculatedAt: staleCapturedAt,
+      evidenceStartAt: staleCapturedAt - 3_600,
+      evidenceEndAt: staleCapturedAt,
+      projectedRunoutAt: NOW + 5_000,
+      evidence,
+    },
+  };
+  const trend = {
+    providerId: "claude",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 10_000,
+    points: [
+      { capturedAt: staleCapturedAt - 3_600, usedPercent: 60 },
+      { capturedAt: staleCapturedAt, usedPercent: 80 },
+    ],
+  };
+  const graph = getQuotaTrendGraphPresentation(
+    [stale],
+    [paused],
+    [trend],
+    NOW,
+  );
+  assert.equal(graph.projectionKind, "last-estimate");
+  assert.equal(graph.statusLabel, "Paused · last estimate");
+  assert.match(graph.ariaLabel, /dashed retained last estimate/);
+
+  const collecting = getQuotaTrendGraphPresentation(
+    [{ ...stale, providerId: "codex", capturedAt: NOW }],
+    [
+      {
+        providerId: "codex",
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: stale.windows[0]!.resetsAt,
+        state: "insufficient",
+        evidence: {
+          sampleCount: 1,
+          distinctCaptureCount: 1,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+      },
+    ],
+    [],
+    NOW,
+  );
+  assert.equal(collecting.actualPath, "");
+  assert.equal(collecting.projectionPath, "");
+  assert.equal(collecting.statusLabel, "Collecting history");
+  assert.match(collecting.ariaLabel, /0 actual points/);
+});
+
+test("draws direct projections only after now while retained estimates survive elapsed time", () => {
+  const capturedAt = NOW - 100;
+  const risk: QuotaSnapshot = {
+    providerId: "codex",
+    connectionState: "connected",
+    capturedAt,
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 80,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: NOW + 1_000,
+      },
+    ],
+  };
+  const trend = {
+    providerId: "codex",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 1_000,
+    points: [
+      { capturedAt: NOW - 200, usedPercent: 70 },
+      { capturedAt, usedPercent: 80 },
+    ],
+  };
+  const evidence = {
+    sampleCount: 10,
+    distinctCaptureCount: 10,
+    spanSeconds: 3_600,
+    increasePercent: 10,
+  };
+  const projectionBase = {
+    providerId: "codex",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: NOW + 1_000,
+    confidence: "high" as const,
+    calculatedAt: NOW - 100,
+    evidenceStartAt: NOW - 3_700,
+    evidenceEndAt: NOW - 100,
+    evidence,
+  };
+  const staleCapturedAt = NOW - 600;
+  const staleRisk: QuotaSnapshot = {
+    ...risk,
+    providerId: "claude",
+    capturedAt: staleCapturedAt,
+  };
+  const staleTrend = {
+    ...trend,
+    providerId: "claude",
+    points: [
+      { capturedAt: staleCapturedAt - 100, usedPercent: 70 },
+      { capturedAt: staleCapturedAt, usedPercent: 80 },
+    ],
+  };
+  const retainedProjectionBase = {
+    confidence: "high" as const,
+    calculatedAt: staleCapturedAt,
+    evidenceStartAt: staleCapturedAt - 3_600,
+    evidenceEndAt: staleCapturedAt,
+    evidence,
+  };
+
+  for (const offset of [-1, 0, 1]) {
+    const direct = getQuotaTrendGraphPresentation(
+      [risk],
+      [
+        {
+          ...projectionBase,
+          state: "projected-runout",
+          projectedRunoutAt: NOW + offset,
+        },
+      ],
+      [trend],
+      NOW,
+      NOW,
+    );
+    assert.equal(
+      direct.projectionKind,
+      offset === 1 ? "forecast" : "none",
+    );
+    assert.equal(
+      direct.statusLabel,
+      offset === 1 ? "History + forecast" : "Forecast unavailable",
+    );
+
+    const retained = getQuotaTrendGraphPresentation(
+      [staleRisk],
+      [
+        {
+          providerId: "claude",
+          windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+          resetsAt: NOW + 1_000,
+          state: "stale-paused",
+          evidence: {
+            sampleCount: 0,
+            distinctCaptureCount: 0,
+            spanSeconds: 0,
+            increasePercent: 0,
+          },
+          retainedEstimate: {
+            ...retainedProjectionBase,
+            state: "projected-runout",
+            projectedRunoutAt: NOW + offset,
+          },
+        },
+      ],
+      [staleTrend],
+      NOW,
+      NOW,
+    );
+    assert.equal(retained.projectionKind, "last-estimate");
+    assert.equal(retained.statusLabel, "Paused · last estimate");
+  }
+});
+
 test("covers every non-connected provider-state row without gauges", () => {
   const cases: Array<{
     state: ProviderConnectionState;
@@ -478,7 +804,12 @@ test("refresh keeps prior snapshots through failure and recovers", () => {
   const oldSnapshots = [snapshot()];
   let state = reducePanelState(initialPanelState, {
     type: "load-succeeded",
-    report: { snapshots: oldSnapshots, forecasts: [] },
+    report: {
+      generatedAt: NOW,
+      snapshots: oldSnapshots,
+      forecasts: [],
+      trends: [],
+    },
   });
   state = reducePanelState(state, { type: "refresh-started" });
   assert.equal(state.refreshing, true);
@@ -495,7 +826,12 @@ test("refresh keeps prior snapshots through failure and recovers", () => {
   const freshSnapshots = [{ ...snapshot(), capturedAt: NOW + 10 }];
   state = reducePanelState(state, {
     type: "refresh-succeeded",
-    report: { snapshots: freshSnapshots, forecasts: [] },
+    report: {
+      generatedAt: NOW + 10,
+      snapshots: freshSnapshots,
+      forecasts: [],
+      trends: [],
+    },
   });
   assert.equal(state.error, undefined);
   assert.equal(state.snapshots, freshSnapshots);

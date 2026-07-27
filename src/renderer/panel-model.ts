@@ -1,14 +1,17 @@
 import {
+  CLAUDE_STALE_AFTER_SECONDS,
   QUOTA_WINDOW_MINUTES,
+  selectCurrentRiskWindow,
   type ClaudeSetupState,
   type QuotaCalculatedForecastEstimate,
   type QuotaForecast,
   type QuotaReport,
   type QuotaSnapshot,
+  type QuotaTrend,
   type QuotaWindow,
 } from "../shared/contracts";
 
-export const CLAUDE_STALE_AFTER_SECONDS = 5 * 60;
+export { CLAUDE_STALE_AFTER_SECONDS };
 
 export type GaugeSeverity = "healthy" | "warning" | "critical" | "stale";
 export type PresentationTone =
@@ -20,8 +23,10 @@ export type PresentationTone =
 export type PanelState = {
   initialLoading: boolean;
   refreshing: boolean;
+  generatedAt: number;
   snapshots: QuotaSnapshot[];
   forecasts: QuotaForecast[];
+  trends: QuotaTrend[];
   error?: string;
 };
 
@@ -35,8 +40,10 @@ export type PanelAction =
 export const initialPanelState: PanelState = {
   initialLoading: true,
   refreshing: false,
+  generatedAt: 0,
   snapshots: [],
   forecasts: [],
+  trends: [],
 };
 
 export function reducePanelState(
@@ -48,8 +55,10 @@ export function reducePanelState(
       return {
         initialLoading: false,
         refreshing: false,
+        generatedAt: action.report.generatedAt,
         snapshots: action.report.snapshots,
         forecasts: action.report.forecasts,
+        trends: action.report.trends,
       };
     case "load-failed":
       return {
@@ -64,8 +73,10 @@ export function reducePanelState(
       return {
         initialLoading: false,
         refreshing: false,
+        generatedAt: action.report.generatedAt,
         snapshots: action.report.snapshots,
         forecasts: action.report.forecasts,
+        trends: action.report.trends,
       };
     case "refresh-failed":
       return {
@@ -311,37 +322,198 @@ export type PanelSummaryPresentation = {
   tone: PresentationTone;
 };
 
+export type CurrentRiskTarget = {
+  snapshot: QuotaSnapshot;
+  window: QuotaWindow;
+  remainingPercent: number;
+};
+
+export function getCurrentRiskTarget(
+  snapshots: QuotaSnapshot[],
+  generatedAt: number,
+): CurrentRiskTarget | undefined {
+  const selected = selectCurrentRiskWindow(snapshots, generatedAt);
+  return selected
+    ? {
+        ...selected,
+        remainingPercent: toRemainingPercent(selected.window.usedPercent),
+      }
+    : undefined;
+}
+
+export type QuotaTrendGraphPresentation = {
+  providerName: string;
+  windowLabel: string;
+  pointCount: number;
+  currentRemaining: number | undefined;
+  actualPath: string;
+  actualPoints: Array<{ x: number; y: number }>;
+  projectionPath: string;
+  projectionKind: "forecast" | "last-estimate" | "none";
+  statusLabel: string;
+  ariaLabel: string;
+  historyX: number | undefined;
+  nowX: number | undefined;
+};
+
+const TREND_LEFT = 4;
+const TREND_RIGHT = 296;
+const TREND_TOP = 4;
+const TREND_BOTTOM = 48;
+
+export function getQuotaTrendGraphPresentation(
+  snapshots: QuotaSnapshot[],
+  forecasts: QuotaForecast[],
+  trends: QuotaTrend[],
+  nowSeconds: number,
+  generatedAt = nowSeconds,
+): QuotaTrendGraphPresentation {
+  const target = getCurrentRiskTarget(snapshots, generatedAt);
+  if (!target) {
+    return {
+      providerName: "Usage",
+      windowLabel: "current window",
+      pointCount: 0,
+      currentRemaining: undefined,
+      actualPath: "",
+      actualPoints: [],
+      projectionPath: "",
+      projectionKind: "none",
+      statusLabel: "Usage trend unavailable",
+      ariaLabel:
+        "Usage trend unavailable. No current provider quota window is available.",
+      historyX: undefined,
+      nowX: undefined,
+    };
+  }
+
+  const { snapshot, window, remainingPercent } = target;
+  const trend = trends.find(
+    (candidate) =>
+      candidate.providerId === snapshot.providerId &&
+      candidate.windowMinutes === window.windowMinutes &&
+      candidate.resetsAt === window.resetsAt,
+  );
+  const forecast = forecasts.find(
+    (candidate) =>
+      candidate.providerId === snapshot.providerId &&
+      candidate.windowMinutes === window.windowMinutes &&
+      candidate.resetsAt === window.resetsAt,
+  );
+  const firstCapturedAt = trend?.points[0]?.capturedAt;
+  const domainStart = firstCapturedAt ?? snapshot.capturedAt;
+  const domainSpan = Math.max(1, window.resetsAt - domainStart);
+  const mapX = (capturedAt: number) =>
+    roundCoordinate(
+      TREND_LEFT +
+        ((capturedAt - domainStart) / domainSpan) *
+          (TREND_RIGHT - TREND_LEFT),
+    );
+  const mapY = (usedPercent: number) =>
+    roundCoordinate(
+      TREND_TOP +
+        (usedPercent / 100) * (TREND_BOTTOM - TREND_TOP),
+    );
+  const actualPoints =
+    trend?.points.map((point) => ({
+      x: mapX(point.capturedAt),
+      y: mapY(point.usedPercent),
+    })) ?? [];
+  const actualPath =
+    actualPoints.length >= 2
+      ? actualPoints
+          .map((point, index) =>
+            `${index === 0 ? "M" : "L"}${point.x} ${point.y}`,
+          )
+          .join(" ")
+      : "";
+
+  let projectionPath = "";
+  let projectionKind: QuotaTrendGraphPresentation["projectionKind"] =
+    "none";
+  const latestPoint = trend?.points.at(-1);
+  const projection =
+    forecast?.state === "projected-runout"
+      ? { at: forecast.projectedRunoutAt, kind: "forecast" as const }
+      : forecast?.state === "stale-paused" &&
+          forecast.retainedEstimate?.state === "projected-runout"
+        ? {
+            at: forecast.retainedEstimate.projectedRunoutAt,
+            kind: "last-estimate" as const,
+          }
+        : undefined;
+  const directProjectionElapsed =
+    forecast?.state === "projected-runout" &&
+    forecast.projectedRunoutAt <= nowSeconds;
+  if (
+    latestPoint &&
+    projection &&
+    projection.at > latestPoint.capturedAt &&
+    projection.at < window.resetsAt &&
+    (projection.kind === "last-estimate" ||
+      projection.at > nowSeconds)
+  ) {
+    projectionPath = `M${mapX(latestPoint.capturedAt)} ${mapY(latestPoint.usedPercent)} L${mapX(projection.at)} ${TREND_BOTTOM}`;
+    projectionKind = projection.kind;
+  }
+
+  const stale =
+    isClaudeSnapshotStale(snapshot, nowSeconds) ||
+    forecast?.state === "stale-paused";
+  const statusLabel = stale
+    ? projectionKind === "last-estimate"
+      ? "Paused · last estimate"
+      : "Stale · forecast paused"
+    : forecast?.state === "unavailable-error"
+      ? "Forecast unavailable"
+      : directProjectionElapsed
+        ? "Forecast unavailable"
+      : trend && trend.points.length >= 2
+        ? projectionKind === "forecast"
+          ? "History + forecast"
+          : forecast?.state === "insufficient"
+            ? "History · building forecast"
+            : "Usage history"
+        : "Collecting history";
+  const providerName = getProviderName(snapshot.providerId);
+  const windowLabel = getWindowLabel(window.windowMinutes);
+  const projectionDescription =
+    projectionKind === "forecast"
+      ? "with a dashed projected runout"
+      : projectionKind === "last-estimate"
+        ? "with a dashed retained last estimate"
+        : "with no runout projection";
+
+  return {
+    providerName,
+    windowLabel,
+    pointCount: trend?.points.length ?? 0,
+    currentRemaining: remainingPercent,
+    actualPath,
+    actualPoints,
+    projectionPath,
+    projectionKind,
+    statusLabel,
+    ariaLabel: `${providerName} ${windowLabel} usage trend. ${trend?.points.length ?? 0} actual ${trend?.points.length === 1 ? "point" : "points"}. ${remainingPercent}% remaining. ${projectionDescription}. ${statusLabel}.`,
+    historyX: firstCapturedAt === undefined ? undefined : TREND_LEFT,
+    nowX:
+      nowSeconds < window.resetsAt
+        ? mapX(Math.max(domainStart, nowSeconds))
+        : undefined,
+  };
+}
+
 export function getPanelSummaryPresentation(
   snapshots: QuotaSnapshot[],
   nowSeconds: number,
+  generatedAt = nowSeconds,
 ): PanelSummaryPresentation {
-  let lowest:
-    | {
-        snapshot: QuotaSnapshot;
-        window: QuotaWindow;
-        remainingPercent: number;
-      }
-    | undefined;
+  const lowest = getCurrentRiskTarget(snapshots, generatedAt);
 
-  for (const snapshot of snapshots) {
-    if (
-      snapshot.connectionState !== "connected" ||
-      isClaudeSnapshotStale(snapshot, nowSeconds)
-    ) {
-      continue;
-    }
-    for (const window of snapshot.windows) {
-      if (window.resetsAt <= nowSeconds) {
-        continue;
-      }
-      const remainingPercent = toRemainingPercent(window.usedPercent);
-      if (!lowest || remainingPercent < lowest.remainingPercent) {
-        lowest = { snapshot, window, remainingPercent };
-      }
-    }
-  }
-
-  if (lowest) {
+  if (
+    lowest &&
+    !isClaudeSnapshotStale(lowest.snapshot, generatedAt)
+  ) {
     const tone = getSeverity(lowest.window.usedPercent);
     return {
       eyebrow: "CURRENT RISK",
@@ -360,7 +532,7 @@ export function getPanelSummaryPresentation(
 
   if (
     snapshots.some((snapshot) =>
-      isClaudeSnapshotStale(snapshot, nowSeconds),
+      isClaudeSnapshotStale(snapshot, generatedAt),
     )
   ) {
     return {
@@ -425,6 +597,10 @@ export function getPanelSummaryPresentation(
     badge: "No data",
     tone: "no-data",
   };
+}
+
+function roundCoordinate(value: number): number {
+  return Math.round(value * 10) / 10;
 }
 
 export type ProviderStatePresentation = {

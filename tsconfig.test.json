@@ -21,6 +21,8 @@
     "src/main/quota-history.test.ts",
     "src/main/quota-forecast.ts",
     "src/main/quota-forecast.test.ts",
+    "src/main/quota-trend.ts",
+    "src/main/quota-trend.test.ts",
     "src/main/providers/codex.ts",
     "src/main/providers/codex.test.ts",
     "src/main/providers/claude.ts",

@@ -21,15 +21,17 @@ export const panelTokens = {
 
 export const summaryTokens = {
   card:
-    "rounded-lg border border-stone-700/80 bg-gradient-to-br from-stone-900 to-[#17140f] px-2.5 py-2",
+    "rounded-lg border border-stone-700/80 bg-gradient-to-br from-stone-900 to-[#17140f] px-2.5 py-1",
   criticalCard:
-    "rounded-lg border border-rose-500/35 bg-gradient-to-br from-rose-950/45 to-[#17100f] px-2.5 py-2",
+    "rounded-lg border border-rose-500/35 bg-gradient-to-br from-rose-950/45 to-[#17100f] px-2.5 py-1",
   warningCard:
-    "rounded-lg border border-amber-500/35 bg-gradient-to-br from-amber-950/35 to-[#17140f] px-2.5 py-2",
+    "rounded-lg border border-amber-500/35 bg-gradient-to-br from-amber-950/35 to-[#17140f] px-2.5 py-1",
   staleCard:
-    "rounded-lg border border-stone-600/70 bg-stone-900/80 px-2.5 py-2",
+    "rounded-lg border border-stone-600/70 bg-stone-900/80 px-2.5 py-1",
   errorCard:
-    "rounded-lg border border-rose-500/30 bg-rose-950/25 px-2.5 py-2",
+    "rounded-lg border border-rose-500/30 bg-rose-950/25 px-2.5 py-1",
+  body: "grid grid-cols-[124px_minmax(0,1fr)] gap-2",
+  copy: "min-w-0",
   top: "flex items-center justify-between gap-2",
   eyebrow:
     "font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-stone-500",
@@ -42,9 +44,38 @@ export const summaryTokens = {
     "font-mono text-[26px] font-bold leading-7 tabular-nums tracking-tight text-rose-300",
   valueStale:
     "font-mono text-[26px] font-bold leading-7 tabular-nums tracking-tight text-stone-500",
-  label: "text-[11px] leading-3 text-stone-300",
+  label: "min-w-0 truncate text-[11px] leading-3 text-stone-300",
   detail:
     "mt-0.5 truncate font-mono text-[10px] leading-3 tabular-nums text-stone-400",
+} as const;
+
+export const trendTokens = {
+  root: "min-w-0 border-l border-stone-800/80 pl-2",
+  heading: "flex items-center justify-between gap-2",
+  title:
+    "truncate font-mono text-[9px] font-semibold uppercase leading-3 tracking-[0.06em] text-stone-300",
+  status:
+    "truncate font-mono text-[8px] leading-3 text-stone-500",
+  chart: "block h-[50px] w-full overflow-visible",
+  guide: "stroke-stone-800 [stroke-width:1]",
+  guideLabel: "fill-stone-700 font-mono text-[6px]",
+  actual:
+    "fill-none stroke-stone-200 [stroke-linecap:round] [stroke-linejoin:round] [stroke-width:2]",
+  point: "fill-stone-100 stroke-[#11100e] [stroke-width:0.75]",
+  projection:
+    "fill-none stroke-amber-400 [stroke-dasharray:5_4] [stroke-linecap:round] [stroke-width:1.5]",
+  lastEstimate:
+    "fill-none stroke-stone-500 [stroke-dasharray:3_4] [stroke-linecap:round] [stroke-width:1.5]",
+  placeholder: "fill-stone-500 font-mono text-[8px]",
+  axisLabel: "fill-stone-600 font-mono text-[6px] uppercase",
+  legend:
+    "-mt-0.5 flex min-h-3 items-center gap-3 font-mono text-[7px] uppercase leading-3 text-stone-500",
+  legendItem: "inline-flex items-center gap-1",
+  actualKey: "inline-block w-3 border-t-2 border-stone-200",
+  projectionKey:
+    "inline-block w-3 border-t border-dashed border-amber-400",
+  lastEstimateKey:
+    "inline-block w-3 border-t border-dashed border-stone-500",
 } as const;
 
 export const providerTokens = {

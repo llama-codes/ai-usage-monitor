@@ -2,6 +2,7 @@ export const QUOTA_WINDOW_MINUTES = {
   fiveHours: 300,
   weekly: 10_080,
 } as const;
+export const CLAUDE_STALE_AFTER_SECONDS = 5 * 60;
 
 export type QuotaWindowMinutes =
   (typeof QUOTA_WINDOW_MINUTES)[keyof typeof QUOTA_WINDOW_MINUTES];
@@ -91,10 +92,61 @@ export type QuotaForecast =
       evidence: QuotaForecastEvidence;
     });
 
+export type QuotaTrendPoint = {
+  capturedAt: number;
+  usedPercent: number;
+};
+
+export type QuotaTrend = {
+  providerId: string;
+  windowMinutes: QuotaWindowMinutes;
+  resetsAt: number;
+  points: QuotaTrendPoint[];
+};
+
 export type QuotaReport = {
+  generatedAt: number;
   snapshots: QuotaSnapshot[];
   forecasts: QuotaForecast[];
+  trends: QuotaTrend[];
 };
+
+export type CurrentRiskWindow = {
+  snapshot: QuotaSnapshot;
+  window: QuotaWindow;
+};
+
+export function selectCurrentRiskWindow(
+  snapshots: readonly QuotaSnapshot[],
+  generatedAt: number,
+): CurrentRiskWindow | undefined {
+  let freshSelected: CurrentRiskWindow | undefined;
+  let staleClaudeSelected: CurrentRiskWindow | undefined;
+  for (const snapshot of snapshots) {
+    if (snapshot.connectionState !== "connected") {
+      continue;
+    }
+    const isStaleClaude =
+      snapshot.providerId === "claude" &&
+      generatedAt - snapshot.capturedAt > CLAUDE_STALE_AFTER_SECONDS;
+    for (const window of snapshot.windows) {
+      if (window.resetsAt <= generatedAt) {
+        continue;
+      }
+      const selected = isStaleClaude
+        ? staleClaudeSelected
+        : freshSelected;
+      if (!selected || window.usedPercent > selected.window.usedPercent) {
+        if (isStaleClaude) {
+          staleClaudeSelected = { snapshot, window };
+        } else {
+          freshSelected = { snapshot, window };
+        }
+      }
+    }
+  }
+  return freshSelected ?? staleClaudeSelected;
+}
 
 export type ForceRefreshRequest = {
   reason: "user";
@@ -190,20 +242,135 @@ export function isQuotaSnapshot(value: unknown): value is QuotaSnapshot {
 }
 
 export function isQuotaReport(value: unknown): value is QuotaReport {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "generatedAt",
+      "snapshots",
+      "forecasts",
+      "trends",
+    ]) ||
+    !isUnixSeconds(value.generatedAt)
+  ) {
+    return false;
+  }
+  const generatedAt = value.generatedAt;
   return (
-    isRecord(value) &&
-    hasExactKeys(value, ["snapshots", "forecasts"]) &&
     Array.isArray(value.snapshots) &&
     value.snapshots.every(isQuotaSnapshot) &&
+    value.snapshots.every(
+      (snapshot) => snapshot.capturedAt <= generatedAt,
+    ) &&
     Array.isArray(value.forecasts) &&
     value.forecasts.every(isQuotaForecast) &&
-    forecastsMatchSnapshots(value.forecasts, value.snapshots)
+    forecastsMatchSnapshots(
+      value.forecasts,
+      value.snapshots,
+      generatedAt,
+    ) &&
+    Array.isArray(value.trends) &&
+    value.trends.length <= 1 &&
+    value.trends.every(isQuotaTrend) &&
+    trendsMatchSnapshots(
+      value.trends,
+      value.snapshots,
+      generatedAt,
+    )
   );
+}
+
+function trendsMatchSnapshots(
+  trends: QuotaTrend[],
+  snapshots: QuotaSnapshot[],
+  generatedAt: number,
+): boolean {
+  const selected = selectCurrentRiskWindow(snapshots, generatedAt);
+  if (trends.length === 0) {
+    return true;
+  }
+  if (!selected) {
+    return false;
+  }
+  const keys = new Set<string>();
+  for (const trend of trends) {
+    const key = `${trend.providerId}:${trend.windowMinutes}`;
+    if (keys.has(key)) {
+      return false;
+    }
+    keys.add(key);
+    const snapshot = snapshots.find(
+      (candidate) => candidate.providerId === trend.providerId,
+    );
+    const window = snapshot?.windows.find(
+      (candidate) =>
+        candidate.windowMinutes === trend.windowMinutes &&
+        candidate.resetsAt === trend.resetsAt,
+    );
+    const latest = trend.points.at(-1);
+    if (
+      !snapshot ||
+      snapshot.connectionState !== "connected" ||
+      !window ||
+      trend.providerId !== selected.snapshot.providerId ||
+      trend.windowMinutes !== selected.window.windowMinutes ||
+      trend.resetsAt !== selected.window.resetsAt ||
+      !latest ||
+      latest.capturedAt !== snapshot.capturedAt ||
+      latest.usedPercent !== window.usedPercent ||
+      trend.points.some(
+        (point) =>
+          point.capturedAt > snapshot.capturedAt ||
+          point.capturedAt >= trend.resetsAt,
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isQuotaTrend(value: unknown): value is QuotaTrend {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "providerId",
+      "windowMinutes",
+      "resetsAt",
+      "points",
+    ]) ||
+    typeof value.providerId !== "string" ||
+    value.providerId.length === 0 ||
+    !isQuotaWindowMinutes(value.windowMinutes) ||
+    !isUnixSeconds(value.resetsAt) ||
+    !Array.isArray(value.points) ||
+    value.points.length === 0 ||
+    value.points.length > 32
+  ) {
+    return false;
+  }
+  let previousCapturedAt = -1;
+  for (const point of value.points) {
+    if (
+      !isRecord(point) ||
+      !hasExactKeys(point, ["capturedAt", "usedPercent"]) ||
+      !isUnixSeconds(point.capturedAt) ||
+      point.capturedAt <= previousCapturedAt ||
+      typeof point.usedPercent !== "number" ||
+      !Number.isFinite(point.usedPercent) ||
+      point.usedPercent < 0 ||
+      point.usedPercent > 100
+    ) {
+      return false;
+    }
+    previousCapturedAt = point.capturedAt;
+  }
+  return true;
 }
 
 function forecastsMatchSnapshots(
   forecasts: QuotaForecast[],
   snapshots: QuotaSnapshot[],
+  generatedAt: number,
 ): boolean {
   const keys = new Set<string>();
   for (const forecast of forecasts) {
@@ -223,6 +390,11 @@ function forecastsMatchSnapshots(
     if (
       !snapshot ||
       !window ||
+      (forecast.state === "stale-paused" &&
+        (snapshot.providerId !== "claude" ||
+          generatedAt - snapshot.capturedAt <=
+            CLAUDE_STALE_AFTER_SECONDS ||
+          window.resetsAt <= generatedAt)) ||
       (forecast.state === "exhausted" &&
         (window.usedPercent < 100 ||
           window.resetsAt <= snapshot.capturedAt)) ||

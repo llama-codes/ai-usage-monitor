@@ -7,6 +7,7 @@ import {
   isQuotaReport,
   isQuotaSnapshot,
   QUOTA_WINDOW_MINUTES,
+  selectCurrentRiskWindow,
   type QuotaSnapshot,
 } from "./contracts";
 
@@ -177,9 +178,15 @@ test("strictly validates quota reports and every forecast state", () => {
   };
   const forecasts = [
     { ...base, state: "insufficient" },
-    { ...base, state: "stale-paused", evidence: emptyEvidence },
     {
       ...base,
+      providerId: "claude",
+      state: "stale-paused",
+      evidence: emptyEvidence,
+    },
+    {
+      ...base,
+      providerId: "claude",
       state: "stale-paused",
       evidence: emptyEvidence,
       retainedEstimate: {
@@ -213,7 +220,13 @@ test("strictly validates quota reports and every forecast state", () => {
   ];
   for (const forecast of forecasts) {
     const matchingSnapshot =
-      forecast.state === "exhausted"
+      forecast.state === "stale-paused"
+        ? {
+            ...snapshot,
+            providerId: "claude",
+            capturedAt: snapshot.capturedAt - 301,
+          }
+        : forecast.state === "exhausted"
         ? {
             ...snapshot,
             windows: snapshot.windows.map((window) => ({
@@ -224,8 +237,10 @@ test("strictly validates quota reports and every forecast state", () => {
         : snapshot;
     assert.equal(
       isQuotaReport({
+        generatedAt: snapshot.capturedAt,
         snapshots: [matchingSnapshot],
         forecasts: [forecast],
+        trends: [],
       }),
       true,
     );
@@ -233,6 +248,7 @@ test("strictly validates quota reports and every forecast state", () => {
   for (const usedPercent of [50, 99.99]) {
     assert.equal(
       isQuotaReport({
+        generatedAt: snapshot.capturedAt,
         snapshots: [
           {
             ...snapshot,
@@ -243,12 +259,14 @@ test("strictly validates quota reports and every forecast state", () => {
           },
         ],
         forecasts: [forecasts[5]],
+        trends: [],
       }),
       false,
     );
   }
   assert.equal(
     isQuotaReport({
+      generatedAt: snapshot.capturedAt,
       snapshots: [
         {
           ...snapshot,
@@ -265,11 +283,29 @@ test("strictly validates quota reports and every forecast state", () => {
           resetsAt: snapshot.capturedAt,
         },
       ],
+      trends: [],
     }),
     false,
   );
-  const report = { snapshots: [snapshot], forecasts: [forecasts[0]] };
+  const report = {
+    generatedAt: snapshot.capturedAt,
+    snapshots: [snapshot],
+    forecasts: [forecasts[0]],
+    trends: [],
+  };
   assert.equal(isQuotaReport({ ...report, unexpected: true }), false);
+  assert.equal(isQuotaReport({ ...report, generatedAt: undefined }), false);
+  assert.equal(
+    isQuotaReport({ ...report, generatedAt: snapshot.capturedAt + 0.5 }),
+    false,
+  );
+  assert.equal(
+    isQuotaReport({
+      ...report,
+      generatedAt: snapshot.capturedAt - 1,
+    }),
+    false,
+  );
   assert.equal(
     isQuotaReport({
       ...report,
@@ -278,7 +314,12 @@ test("strictly validates quota reports and every forecast state", () => {
     false,
   );
   assert.equal(
-    isQuotaReport({ snapshots: [], forecasts: [forecasts[0]] }),
+    isQuotaReport({
+      generatedAt: snapshot.capturedAt,
+      snapshots: [],
+      forecasts: [forecasts[0]],
+      trends: [],
+    }),
     false,
   );
   assert.equal(
@@ -364,8 +405,293 @@ test("strictly validates quota reports and every forecast state", () => {
     },
   ]) {
     assert.equal(
-      isQuotaReport({ snapshots: [snapshot], forecasts: [invalid] }),
+      isQuotaReport({
+        generatedAt: snapshot.capturedAt,
+        snapshots: [snapshot],
+        forecasts: [invalid],
+        trends: [],
+      }),
       false,
     );
   }
+});
+
+test("strictly binds bounded chronological trends to current snapshot windows", () => {
+  const snapshot: QuotaSnapshot = {
+    providerId: "codex",
+    connectionState: "connected",
+    capturedAt: 1_800_000_100,
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 40,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: 1_800_010_000,
+      },
+    ],
+  };
+  const trend = {
+    providerId: "codex",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: 1_800_010_000,
+    points: [
+      { capturedAt: 1_800_000_000, usedPercent: 30 },
+      { capturedAt: 1_800_000_100, usedPercent: 40 },
+    ],
+  };
+  const valid = {
+    generatedAt: snapshot.capturedAt,
+    snapshots: [snapshot],
+    forecasts: [],
+    trends: [trend],
+  };
+  assert.equal(isQuotaReport(valid), true);
+  assert.equal(
+    isQuotaReport({
+      generatedAt: snapshot.capturedAt,
+      snapshots: [snapshot],
+      forecasts: [],
+      trends: [],
+    }),
+    true,
+  );
+  assert.equal(
+    isQuotaReport({
+      generatedAt: snapshot.capturedAt,
+      snapshots: [snapshot],
+      forecasts: [],
+    }),
+    false,
+  );
+
+  for (const invalidTrend of [
+    { ...trend, providerId: "claude" },
+    { ...trend, windowMinutes: QUOTA_WINDOW_MINUTES.weekly },
+    { ...trend, resetsAt: trend.resetsAt + 1 },
+    { ...trend, extra: true },
+    { ...trend, points: [] },
+    {
+      ...trend,
+      points: [
+        trend.points[0],
+        { ...trend.points[1], capturedAt: trend.points[0]!.capturedAt },
+      ],
+    },
+    {
+      ...trend,
+      points: [trend.points[0], { ...trend.points[1], usedPercent: 101 }],
+    },
+    {
+      ...trend,
+      points: [trend.points[0], { ...trend.points[1], usedPercent: 39 }],
+    },
+    {
+      ...trend,
+      points: [
+        trend.points[0],
+        { ...trend.points[1], capturedAt: snapshot.capturedAt - 1 },
+      ],
+    },
+    {
+      ...trend,
+      points: [
+        trend.points[0],
+        { ...trend.points[1], capturedAt: snapshot.capturedAt + 1 },
+      ],
+    },
+    {
+      ...trend,
+      points: [
+        trend.points[0],
+        { ...trend.points[1], unexpected: true },
+      ],
+    },
+    {
+      ...trend,
+      points: Array.from({ length: 33 }, (_, index) => ({
+        capturedAt: trend.points[0]!.capturedAt + index,
+        usedPercent: index,
+      })),
+    },
+  ]) {
+    assert.equal(
+      isQuotaReport({
+        generatedAt: snapshot.capturedAt,
+        snapshots: [snapshot],
+        forecasts: [],
+        trends: [invalidTrend],
+      }),
+      false,
+    );
+  }
+  assert.equal(
+    isQuotaReport({
+      ...valid,
+      trends: [trend, trend],
+    }),
+    false,
+  );
+  const higherRiskSnapshot: QuotaSnapshot = {
+    ...snapshot,
+    providerId: "claude",
+    windows: [
+      {
+        ...snapshot.windows[0]!,
+        usedPercent: 80,
+      },
+    ],
+  };
+  assert.equal(
+    isQuotaReport({
+      ...valid,
+      snapshots: [snapshot, higherRiskSnapshot],
+    }),
+    false,
+  );
+  assert.equal(
+    isQuotaReport({
+      generatedAt: snapshot.capturedAt,
+      snapshots: [{ ...snapshot, connectionState: "error" }],
+      forecasts: [],
+      trends: [trend],
+    }),
+    false,
+  );
+});
+
+test("uses stale Claude only as a current-risk fallback", () => {
+  const generatedAt = 1_800_000_500;
+  const staleClaude: QuotaSnapshot = {
+    providerId: "claude",
+    connectionState: "connected",
+    capturedAt: generatedAt - 301,
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 99,
+        windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+        resetsAt: generatedAt + 1_000,
+      },
+    ],
+  };
+  const freshCodex: QuotaSnapshot = {
+    providerId: "codex",
+    connectionState: "connected",
+    capturedAt: generatedAt,
+    windows: [
+      {
+        label: "Weekly",
+        usedPercent: 40,
+        windowMinutes: QUOTA_WINDOW_MINUTES.weekly,
+        resetsAt: generatedAt + 2_000,
+      },
+    ],
+  };
+
+  assert.equal(
+    selectCurrentRiskWindow([staleClaude], generatedAt)?.snapshot.providerId,
+    "claude",
+  );
+  assert.equal(
+    selectCurrentRiskWindow(
+      [staleClaude, freshCodex],
+      generatedAt,
+    )?.snapshot.providerId,
+    "codex",
+  );
+
+  const stalePaused = {
+    providerId: "claude",
+    windowMinutes: QUOTA_WINDOW_MINUTES.fiveHours,
+    resetsAt: staleClaude.windows[0]!.resetsAt,
+    state: "stale-paused",
+    evidence: {
+      sampleCount: 0,
+      distinctCaptureCount: 0,
+      spanSeconds: 0,
+      increasePercent: 0,
+    },
+  };
+  assert.equal(
+    isQuotaReport({
+      generatedAt,
+      snapshots: [staleClaude],
+      forecasts: [stalePaused],
+      trends: [],
+    }),
+    true,
+  );
+  assert.equal(
+    isQuotaReport({
+      generatedAt,
+      snapshots: [{ ...staleClaude, capturedAt: generatedAt }],
+      forecasts: [stalePaused],
+      trends: [],
+    }),
+    false,
+  );
+  assert.equal(
+    isQuotaReport({
+      generatedAt,
+      snapshots: [
+        {
+          ...staleClaude,
+          providerId: "codex",
+        },
+      ],
+      forecasts: [{ ...stalePaused, providerId: "codex" }],
+      trends: [],
+    }),
+    false,
+  );
+  for (const resetOffset of [-1, 0]) {
+    assert.equal(
+      isQuotaReport({
+        generatedAt,
+        snapshots: [
+          {
+            ...staleClaude,
+            windows: [
+              {
+                ...staleClaude.windows[0]!,
+                resetsAt: generatedAt + resetOffset,
+              },
+            ],
+          },
+        ],
+        forecasts: [
+          {
+            ...stalePaused,
+            resetsAt: generatedAt + resetOffset,
+          },
+        ],
+        trends: [],
+      }),
+      false,
+    );
+  }
+  assert.equal(
+    isQuotaReport({
+      generatedAt,
+      snapshots: [
+        {
+          ...staleClaude,
+          windows: [
+            {
+              ...staleClaude.windows[0]!,
+              resetsAt: generatedAt + 1,
+            },
+          ],
+        },
+      ],
+      forecasts: [
+        {
+          ...stalePaused,
+          resetsAt: generatedAt + 1,
+        },
+      ],
+      trends: [],
+    }),
+    true,
+  );
 });

@@ -22,9 +22,11 @@ import {
   isInstallClaudeHookRequest,
   isQuotaSnapshot,
   isQuitRequestArguments,
+  selectCurrentRiskWindow,
   type QuotaForecast,
   type QuotaReport,
   type QuotaSnapshot,
+  type QuotaTrend,
   type ClaudeSetupState,
 } from "../shared/contracts";
 import { positionPopup } from "./position";
@@ -46,6 +48,7 @@ import {
   type QuotaHistoryStore,
 } from "./quota-history";
 import { deriveQuotaForecast } from "./quota-forecast";
+import { deriveQuotaTrend } from "./quota-trend";
 import { ClaudeQuotaProvider } from "./providers/claude";
 import { CodexQuotaProvider } from "./providers/codex";
 import {
@@ -149,7 +152,9 @@ function cleanupSelfTestOnboarding(): void {
 }
 
 let cachedSnapshots = createInitialSnapshots();
+let cachedGeneratedAt = cachedSnapshots[0]?.capturedAt ?? nowSeconds();
 let cachedForecasts: QuotaForecast[] = [];
+let cachedTrends: QuotaTrend[] = [];
 
 const rendererPath = path.join(__dirname, "..", "renderer", "index.html");
 const rendererUrl = pathToFileURL(rendererPath).toString();
@@ -258,7 +263,12 @@ async function refreshProviderSnapshots(): Promise<{
 }
 
 function cachedQuotaReport(): QuotaReport {
-  return { snapshots: cachedSnapshots, forecasts: cachedForecasts };
+  return {
+    generatedAt: cachedGeneratedAt,
+    snapshots: cachedSnapshots,
+    forecasts: cachedForecasts,
+    trends: cachedTrends,
+  };
 }
 
 function unavailableForecasts(
@@ -318,6 +328,7 @@ async function refreshMonitor(reason: RefreshReason): Promise<QuotaReport> {
     const evaluatedAt = nowSeconds();
     const priorForecasts = cachedForecasts;
     cachedSnapshots = result.snapshots;
+    cachedGeneratedAt = evaluatedAt;
     let historyAppendSucceeded = true;
     try {
       await quotaHistoryStore.append(result.snapshots, evaluatedAt);
@@ -332,6 +343,7 @@ async function refreshMonitor(reason: RefreshReason): Promise<QuotaReport> {
     }
     if (!historyAppendSucceeded) {
       cachedForecasts = unavailableForecasts(cachedSnapshots);
+      cachedTrends = [];
     } else {
       try {
         const currentSegments =
@@ -356,8 +368,27 @@ async function refreshMonitor(reason: RefreshReason): Promise<QuotaReport> {
             ),
           ),
         );
+        const selected = selectCurrentRiskWindow(
+          cachedSnapshots,
+          evaluatedAt,
+        );
+        const trend = selected
+          ? deriveQuotaTrend(
+              selected.snapshot,
+              selected.window,
+              currentSegments.find(
+                (segment) =>
+                  segment.providerId === selected.snapshot.providerId &&
+                  segment.windowMinutes === selected.window.windowMinutes &&
+                  segment.resetsAt === selected.window.resetsAt,
+              ),
+              evaluatedAt,
+            )
+          : undefined;
+        cachedTrends = trend ? [trend] : [];
       } catch {
         cachedForecasts = unavailableForecasts(cachedSnapshots);
+        cachedTrends = [];
         safeLog("quota-forecast-unavailable", {
           code: "history-read-or-derive-failed",
         });
@@ -1028,6 +1059,7 @@ async function verifyConnectedPanelRendering(): Promise<void> {
     increasePercent: 5,
   };
   popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    generatedAt: capturedAt,
     snapshots: connectedFixture,
     forecasts: [
       {
@@ -1054,8 +1086,18 @@ async function verifyConnectedPanelRendering(): Promise<void> {
         evidence,
       },
     ],
+    trends: [],
   } satisfies QuotaReport);
 
+  let lastPanel:
+    | {
+        labels: string[];
+        noVerticalOverflow: boolean;
+        scrollDelta: number;
+        refreshFocusable: boolean;
+        quitFocusable: boolean;
+      }
+    | undefined;
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const panel = (await popup.webContents.executeJavaScript(`(() => {
       const content = document.querySelector("[data-panel-content]");
@@ -1080,15 +1122,20 @@ async function verifyConnectedPanelRendering(): Promise<void> {
         labels,
         noVerticalOverflow:
           Boolean(content) && content.scrollHeight <= content.clientHeight + 1,
+        scrollDelta: content
+          ? content.scrollHeight - content.clientHeight
+          : -1,
         refreshFocusable: focusableControl("Refresh"),
         quitFocusable: focusableControl("Quit")
       };
     })()`)) as {
       labels: string[];
       noVerticalOverflow: boolean;
+      scrollDelta: number;
       refreshFocusable: boolean;
       quitFocusable: boolean;
     };
+    lastPanel = panel;
     if (
       panel.labels.length === 2 &&
       panel.labels.some((label) => label.startsWith("5-hour:")) &&
@@ -1100,6 +1147,7 @@ async function verifyConnectedPanelRendering(): Promise<void> {
       log("self-test-connected-panel-pass", {
         windows: panel.labels,
         noVerticalOverflow: panel.noVerticalOverflow,
+        scrollDelta: panel.scrollDelta,
         controlsFocusable: true,
       });
       return;
@@ -1107,7 +1155,7 @@ async function verifyConnectedPanelRendering(): Promise<void> {
     await delay(25);
   }
   throw new Error(
-    "Connected two-window panel did not render without vertical overflow",
+    `Connected two-window panel did not render without vertical overflow: ${JSON.stringify(lastPanel)}`,
   );
 }
 
@@ -1144,6 +1192,7 @@ async function verifyForecastPanelRendering(): Promise<void> {
     increasePercent: 5,
   };
   const report: QuotaReport = {
+    generatedAt: capturedAt,
     snapshots,
     forecasts: [
       {
@@ -1179,21 +1228,12 @@ async function verifyForecastPanelRendering(): Promise<void> {
         providerId: "claude",
         windowMinutes: 300,
         resetsAt: fiveHourReset,
-        state: "stale-paused",
-        evidence: {
-          sampleCount: 0,
-          distinctCaptureCount: 0,
-          spanSeconds: 0,
-          increasePercent: 0,
-        },
-        retainedEstimate: {
-          state: "safe-through-reset",
-          confidence: "medium",
-          calculatedAt: capturedAt - 301,
-          evidenceStartAt: capturedAt - 2_101,
-          evidenceEndAt: capturedAt - 301,
-          evidence: mediumEvidence,
-        },
+        state: "safe-through-reset",
+        confidence: "medium",
+        calculatedAt: capturedAt,
+        evidenceStartAt: capturedAt - 1_800,
+        evidenceEndAt: capturedAt,
+        evidence: mediumEvidence,
       },
       {
         providerId: "claude",
@@ -1209,9 +1249,169 @@ async function verifyForecastPanelRendering(): Promise<void> {
         },
       },
     ],
+    trends: [
+      {
+        providerId: "claude",
+        windowMinutes: 10_080,
+        resetsAt: weeklyReset,
+        points: [
+          { capturedAt: capturedAt - 86_400, usedPercent: 80 },
+          { capturedAt: capturedAt - 3_600, usedPercent: 95 },
+          { capturedAt, usedPercent: 100 },
+        ],
+      },
+    ],
   };
+
+  const projectedGraphReport: QuotaReport = {
+    generatedAt: capturedAt,
+    snapshots: [report.snapshots[0]!],
+    forecasts: [report.forecasts[1]!],
+    trends: [
+      {
+        providerId: "codex",
+        windowMinutes: 10_080,
+        resetsAt: weeklyReset,
+        points: [
+          { capturedAt: capturedAt - 86_400, usedPercent: 45 },
+          { capturedAt: capturedAt - 43_200, usedPercent: 54 },
+          { capturedAt, usedPercent: 64 },
+        ],
+      },
+    ],
+  };
+  popup.webContents.send(
+    IPC_CHANNELS.quotaUpdated,
+    projectedGraphReport,
+  );
+  await delay(25);
+  const projectedGraph = (await popup.webContents.executeJavaScript(`(() => {
+    const graph = document.querySelector("[data-usage-trend]");
+    const svg = graph?.querySelector('svg[role="img"]');
+    return {
+      actual: Boolean(graph?.querySelector("[data-actual-trend]")),
+      projection: Boolean(graph?.querySelector("[data-runout-projection]")),
+      projectionKind: graph?.getAttribute("data-projection-kind"),
+      pointCount: graph?.getAttribute("data-trend-points"),
+      aria: svg?.querySelector("desc")?.textContent ?? ""
+    };
+  })()`)) as {
+    actual: boolean;
+    projection: boolean;
+    projectionKind: string | null;
+    pointCount: string | null;
+    aria: string;
+  };
+  if (
+    !projectedGraph.actual ||
+    !projectedGraph.projection ||
+    projectedGraph.projectionKind !== "forecast" ||
+    projectedGraph.pointCount !== "3" ||
+    !projectedGraph.aria.includes("Codex Weekly usage trend")
+  ) {
+    throw new Error(
+      `Projected trend graph failed: ${JSON.stringify(projectedGraph)}`,
+    );
+  }
+
+  const staleCapturedAt = capturedAt - 301;
+  const pausedGraphReport: QuotaReport = {
+    generatedAt: capturedAt,
+    snapshots: [
+      {
+        providerId: "claude",
+        connectionState: "connected",
+        capturedAt: staleCapturedAt,
+        windows: [
+          {
+            label: "Five hours",
+            usedPercent: 80,
+            windowMinutes: 300,
+            resetsAt: fiveHourReset,
+          },
+        ],
+      },
+    ],
+    forecasts: [
+      {
+        providerId: "claude",
+        windowMinutes: 300,
+        resetsAt: fiveHourReset,
+        state: "stale-paused",
+        evidence: {
+          sampleCount: 0,
+          distinctCaptureCount: 0,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+        retainedEstimate: {
+          state: "projected-runout",
+          confidence: "medium",
+          calculatedAt: staleCapturedAt,
+          evidenceStartAt: staleCapturedAt - 1_800,
+          evidenceEndAt: staleCapturedAt,
+          projectedRunoutAt: capturedAt + 1_800,
+          evidence: mediumEvidence,
+        },
+      },
+    ],
+    trends: [
+      {
+        providerId: "claude",
+        windowMinutes: 300,
+        resetsAt: fiveHourReset,
+        points: [
+          { capturedAt: staleCapturedAt - 1_800, usedPercent: 65 },
+          { capturedAt: staleCapturedAt, usedPercent: 80 },
+        ],
+      },
+    ],
+  };
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, pausedGraphReport);
+  await delay(25);
+  const pausedProjectionKind =
+    (await popup.webContents.executeJavaScript(
+      `document.querySelector("[data-usage-trend]")?.getAttribute(
+        "data-projection-kind"
+      ) ?? ""`,
+    )) as string;
+  if (pausedProjectionKind !== "last-estimate") {
+    throw new Error("Stale trend did not render its retained last estimate");
+  }
+
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    generatedAt: capturedAt,
+    snapshots: [
+      {
+        ...report.snapshots[0]!,
+        windows: [report.snapshots[0]!.windows[0]!],
+      },
+    ],
+    forecasts: [report.forecasts[0]!],
+    trends: [],
+  } satisfies QuotaReport);
+  await delay(25);
+  const collectingGraph = (await popup.webContents.executeJavaScript(`(() => {
+    const graph = document.querySelector("[data-usage-trend]");
+    return {
+      text: graph?.textContent ?? "",
+      actual: Boolean(graph?.querySelector("[data-actual-trend]")),
+      projection: Boolean(graph?.querySelector("[data-runout-projection]"))
+    };
+  })()`)) as { text: string; actual: boolean; projection: boolean };
+  if (
+    !collectingGraph.text.includes("Collecting history") ||
+    collectingGraph.actual ||
+    collectingGraph.projection
+  ) {
+    throw new Error(
+      `Missing-history trend was not honest: ${JSON.stringify(collectingGraph)}`,
+    );
+  }
+
   popup.webContents.send(IPC_CHANNELS.quotaUpdated, report);
 
+  let forecastScrollDelta: number | undefined;
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const panel = (await popup.webContents.executeJavaScript(`(() => {
       const content = document.querySelector("[data-panel-content]");
@@ -1241,6 +1441,9 @@ async function verifyForecastPanelRendering(): Promise<void> {
         text,
         noVerticalOverflow:
           Boolean(content) && content.scrollHeight <= content.clientHeight + 1,
+        scrollDelta: content
+          ? content.scrollHeight - content.clientHeight
+          : -1,
         refreshFocusable: focusableControl("Refresh"),
         quitFocusable: focusableControl("Quit")
       };
@@ -1249,6 +1452,7 @@ async function verifyForecastPanelRendering(): Promise<void> {
       forecastTitles: string[];
       text: string;
       noVerticalOverflow: boolean;
+      scrollDelta: number;
       refreshFocusable: boolean;
       quitFocusable: boolean;
     };
@@ -1256,16 +1460,15 @@ async function verifyForecastPanelRendering(): Promise<void> {
       panel.meterCount === 4 &&
       panel.forecastTitles.length === 4 &&
       panel.text.includes("Not enough history") &&
-      panel.text.includes("Forecast paused — data stale") &&
       panel.text.includes("Safe through reset") &&
       panel.text.includes("May run out around") &&
       panel.text.includes("Limit reached") &&
-      panel.text.includes("Last estimate:") &&
       panel.text.includes("High confidence") &&
       panel.noVerticalOverflow &&
       panel.refreshFocusable &&
       panel.quitFocusable
     ) {
+      forecastScrollDelta = panel.scrollDelta;
       break;
     }
     if (attempt === 39) {
@@ -1274,6 +1477,97 @@ async function verifyForecastPanelRendering(): Promise<void> {
       );
     }
     await delay(25);
+  }
+
+  const acceptedTrendPointCount =
+    (await popup.webContents.executeJavaScript(
+      `document.querySelector("[data-usage-trend]")?.getAttribute(
+        "data-trend-points"
+      ) ?? ""`,
+    )) as string;
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    ...report,
+    trends: [
+      {
+        ...report.trends[0]!,
+        points: report.trends[0]!.points.map((point, index) =>
+          index === 0 ? { ...point, unexpected: true } : point,
+        ),
+      },
+    ],
+  });
+  await delay(25);
+  const trendPointCountAfterMalformed =
+    (await popup.webContents.executeJavaScript(
+      `document.querySelector("[data-usage-trend]")?.getAttribute(
+        "data-trend-points"
+      ) ?? ""`,
+    )) as string;
+  if (
+    acceptedTrendPointCount !== "3" ||
+    trendPointCountAfterMalformed !== acceptedTrendPointCount
+  ) {
+    throw new Error("Preload accepted a malformed trend update");
+  }
+
+  const rejectedTrendUpdates = [
+    {
+      ...report,
+      trends: [
+        {
+          providerId: "codex",
+          windowMinutes: 10_080,
+          resetsAt: weeklyReset,
+          points: [
+            { capturedAt: capturedAt - 86_400, usedPercent: 45 },
+            { capturedAt, usedPercent: 64 },
+          ],
+        },
+      ],
+    },
+    {
+      ...report,
+      trends: [
+        {
+          ...report.trends[0]!,
+          points: report.trends[0]!.points.map((point, index) =>
+            index === report.trends[0]!.points.length - 1
+              ? { ...point, usedPercent: 99 }
+              : point,
+          ),
+        },
+      ],
+    },
+    {
+      ...pausedGraphReport,
+      snapshots: pausedGraphReport.snapshots.map((snapshot) => ({
+        ...snapshot,
+        windows: snapshot.windows.map((window) => ({
+          ...window,
+          resetsAt: capturedAt,
+        })),
+      })),
+      forecasts: pausedGraphReport.forecasts.map((forecast) => ({
+        ...forecast,
+        resetsAt: capturedAt,
+      })),
+      trends: [],
+    },
+  ];
+  for (const invalidReport of rejectedTrendUpdates) {
+    popup.webContents.send(IPC_CHANNELS.quotaUpdated, invalidReport);
+    await delay(25);
+    const pointCount =
+      (await popup.webContents.executeJavaScript(
+        `document.querySelector("[data-usage-trend]")?.getAttribute(
+          "data-trend-points"
+        ) ?? ""`,
+      )) as string;
+    if (pointCount !== acceptedTrendPointCount) {
+      throw new Error(
+        "Preload accepted a non-current or latest-mismatched trend update",
+      );
+    }
   }
 
   popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
@@ -1382,7 +1676,9 @@ async function verifyForecastPanelRendering(): Promise<void> {
     retainedStaleEstimate: true,
     windows: 4,
     noVerticalOverflow: true,
+    scrollDelta: forecastScrollDelta,
     strictUpdateValidation: true,
+    trendStates: ["projected", "stale-paused", "collecting"],
   });
 }
 
@@ -1662,7 +1958,8 @@ async function runSelfTest(): Promise<void> {
       appendFailureReport.forecasts.length !== 4 ||
       !appendFailureReport.forecasts.every(
         (forecast) => forecast.state === "unavailable-error",
-      )
+      ) ||
+      appendFailureReport.trends.length !== 0
     ) {
       throw new Error(
         "History append failure escaped the quota refresh",
@@ -1687,7 +1984,8 @@ async function runSelfTest(): Promise<void> {
       readFailureReport.forecasts.length !== 4 ||
       !readFailureReport.forecasts.every(
         (forecast) => forecast.state === "unavailable-error",
-      )
+      ) ||
+      readFailureReport.trends.length !== 0
     ) {
       throw new Error("History read failure escaped the quota refresh");
     }
