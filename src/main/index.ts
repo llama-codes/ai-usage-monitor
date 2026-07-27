@@ -22,6 +22,8 @@ import {
   isInstallClaudeHookRequest,
   isQuotaSnapshot,
   isQuitRequestArguments,
+  type QuotaForecast,
+  type QuotaReport,
   type QuotaSnapshot,
   type ClaudeSetupState,
 } from "../shared/contracts";
@@ -36,6 +38,14 @@ import {
 } from "./monitor-state";
 import { BackgroundTaskScheduler } from "./background-task";
 import { retainNotification } from "./notification-lifetime";
+import {
+  FileQuotaHistoryStore,
+  MemoryQuotaHistoryStore,
+  QuotaHistoryStoreError,
+  resolveQuotaHistoryPath,
+  type QuotaHistoryStore,
+} from "./quota-history";
+import { deriveQuotaForecast } from "./quota-forecast";
 import { ClaudeQuotaProvider } from "./providers/claude";
 import { CodexQuotaProvider } from "./providers/codex";
 import {
@@ -80,7 +90,7 @@ let popup: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
 let currentTraySeverity: TraySeverity = "warning";
-let refreshInFlight: Promise<QuotaSnapshot[]> | null = null;
+let refreshInFlight: Promise<QuotaReport> | null = null;
 let pollTimer: NodeJS.Timeout | undefined;
 let trayWatchdogTimer: NodeJS.Timeout | undefined;
 let selfTestHeartbeatTimer: NodeJS.Timeout | undefined;
@@ -88,6 +98,7 @@ let selfTestOnboardingRoot: string | undefined;
 const monitorPolicy = new QuotaMonitorPolicy();
 const selfTestNotificationActivations: Array<() => void> = [];
 const activeNotifications = new Set<Notification>();
+let quotaHistoryStore: QuotaHistoryStore = new MemoryQuotaHistoryStore();
 const backgroundTasks = new BackgroundTaskScheduler((error) => {
   safeLog("background-task-failed", {
     message: error instanceof Error ? error.message : "Unknown error",
@@ -138,6 +149,7 @@ function cleanupSelfTestOnboarding(): void {
 }
 
 let cachedSnapshots = createInitialSnapshots();
+let cachedForecasts: QuotaForecast[] = [];
 
 const rendererPath = path.join(__dirname, "..", "renderer", "index.html");
 const rendererUrl = pathToFileURL(rendererPath).toString();
@@ -245,14 +257,39 @@ async function refreshProviderSnapshots(): Promise<{
   };
 }
 
-function broadcastCachedSnapshots(): void {
+function cachedQuotaReport(): QuotaReport {
+  return { snapshots: cachedSnapshots, forecasts: cachedForecasts };
+}
+
+function unavailableForecasts(
+  snapshots: readonly QuotaSnapshot[],
+): QuotaForecast[] {
+  return snapshots.flatMap((snapshot) =>
+    snapshot.connectionState === "connected"
+      ? snapshot.windows.map((window) => ({
+          providerId: snapshot.providerId,
+          windowMinutes: window.windowMinutes,
+          resetsAt: window.resetsAt,
+          state: "unavailable-error" as const,
+          evidence: {
+            sampleCount: 0,
+            distinctCaptureCount: 0,
+            spanSeconds: 0,
+            increasePercent: 0,
+          },
+        }))
+      : [],
+  );
+}
+
+function broadcastCachedReport(): void {
   if (
     popup &&
     !popup.isDestroyed() &&
     !popup.webContents.isLoading()
   ) {
     try {
-      popup.webContents.send(IPC_CHANNELS.quotaUpdated, cachedSnapshots);
+      popup.webContents.send(IPC_CHANNELS.quotaUpdated, cachedQuotaReport());
       state.broadcasts += 1;
     } catch (error) {
       log("renderer-broadcast-failed", {
@@ -262,7 +299,7 @@ function broadcastCachedSnapshots(): void {
   }
 }
 
-async function refreshMonitor(reason: RefreshReason): Promise<QuotaSnapshot[]> {
+async function refreshMonitor(reason: RefreshReason): Promise<QuotaReport> {
   if (refreshInFlight) {
     log("refresh-coalesced", { reason });
     return refreshInFlight;
@@ -278,18 +315,65 @@ async function refreshMonitor(reason: RefreshReason): Promise<QuotaSnapshot[]> {
     log("refresh", { refreshes: state.refreshes, reason });
 
     const result = await refreshProviderSnapshots();
+    const evaluatedAt = nowSeconds();
+    const priorForecasts = cachedForecasts;
     cachedSnapshots = result.snapshots;
+    let historyAppendSucceeded = true;
+    try {
+      await quotaHistoryStore.append(result.snapshots, evaluatedAt);
+    } catch (error) {
+      historyAppendSucceeded = false;
+      safeLog("quota-history-write-failed", {
+        code:
+          error instanceof QuotaHistoryStoreError
+            ? error.code
+            : "write-failed",
+      });
+    }
+    if (!historyAppendSucceeded) {
+      cachedForecasts = unavailableForecasts(cachedSnapshots);
+    } else {
+      try {
+        const currentSegments =
+          await quotaHistoryStore.readCurrent(evaluatedAt);
+        cachedForecasts = cachedSnapshots.flatMap((snapshot) =>
+          snapshot.windows.map((window) =>
+            deriveQuotaForecast(
+              snapshot,
+              window.windowMinutes,
+              currentSegments.find(
+                (segment) =>
+                  segment.providerId === snapshot.providerId &&
+                  segment.windowMinutes === window.windowMinutes,
+              ),
+              evaluatedAt,
+              priorForecasts.find(
+                (forecast) =>
+                  forecast.providerId === snapshot.providerId &&
+                  forecast.windowMinutes === window.windowMinutes &&
+                  forecast.resetsAt === window.resetsAt,
+              ),
+            ),
+          ),
+        );
+      } catch {
+        cachedForecasts = unavailableForecasts(cachedSnapshots);
+        safeLog("quota-forecast-unavailable", {
+          code: "history-read-or-derive-failed",
+        });
+      }
+    }
     const decision = monitorPolicy.evaluate({
       snapshots: cachedSnapshots,
       refreshFailed: result.refreshFailed,
-      nowSeconds: nowSeconds(),
+      nowSeconds: evaluatedAt,
     });
     updateTraySeverity(decision.traySeverity);
-    broadcastCachedSnapshots();
+    broadcastCachedReport();
     for (const notification of decision.notifications) {
       deliverNotification(notification);
     }
-    return cachedSnapshots;
+    return cachedQuotaReport();
   })();
   refreshInFlight = operation;
   try {
@@ -319,15 +403,15 @@ function assertTrustedSender(event: IpcMainInvokeEvent): void {
 
 async function readQuota(
   event: IpcMainInvokeEvent,
-): Promise<QuotaSnapshot[]> {
+): Promise<QuotaReport> {
   assertTrustedSender(event);
-  return cachedSnapshots;
+  return cachedQuotaReport();
 }
 
 async function forceRefresh(
   event: IpcMainInvokeEvent,
   payload: unknown,
-): Promise<QuotaSnapshot[]> {
+): Promise<QuotaReport> {
   assertTrustedSender(event);
   if (!isForceRefreshRequest(payload)) {
     throw new TypeError("Invalid forced-refresh request");
@@ -485,7 +569,7 @@ function showPopup(trayBounds: Rectangle, reason: string): void {
   if (!popup) {
     return;
   }
-  broadcastCachedSnapshots();
+  broadcastCachedReport();
   placePopup(trayBounds);
   popup.show();
   log("popup-shown-focused", {
@@ -937,7 +1021,40 @@ async function verifyConnectedPanelRendering(): Promise<void> {
     cachedSnapshots.find((snapshot) => snapshot.providerId === "claude") ??
       createProviderErrorSnapshot("claude"),
   ];
-  popup.webContents.send(IPC_CHANNELS.quotaUpdated, connectedFixture);
+  const evidence = {
+    sampleCount: 6,
+    distinctCaptureCount: 6,
+    spanSeconds: 12 * 60 * 60,
+    increasePercent: 5,
+  };
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    snapshots: connectedFixture,
+    forecasts: [
+      {
+        providerId: "codex",
+        windowMinutes: 300,
+        resetsAt: capturedAt + 3_600,
+        state: "insufficient",
+        evidence: {
+          sampleCount: 1,
+          distinctCaptureCount: 1,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+      },
+      {
+        providerId: "codex",
+        windowMinutes: 10_080,
+        resetsAt: capturedAt + 604_800,
+        state: "safe-through-reset",
+        confidence: "medium",
+        calculatedAt: capturedAt,
+        evidenceStartAt: capturedAt - 12 * 60 * 60,
+        evidenceEndAt: capturedAt,
+        evidence,
+      },
+    ],
+  } satisfies QuotaReport);
 
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const panel = (await popup.webContents.executeJavaScript(`(() => {
@@ -994,6 +1111,281 @@ async function verifyConnectedPanelRendering(): Promise<void> {
   );
 }
 
+async function verifyForecastPanelRendering(): Promise<void> {
+  if (!popup) {
+    throw new Error("Popup was not initialized");
+  }
+  const capturedAt = nowSeconds();
+  const fiveHourReset = capturedAt + 3_600;
+  const weeklyReset = capturedAt + 604_800;
+  const snapshots = (["codex", "claude"] as const).map((providerId) => ({
+    providerId,
+    connectionState: "connected" as const,
+    capturedAt,
+    windows: [
+      {
+        label: "Five hours",
+        usedPercent: 42,
+        windowMinutes: 300 as const,
+        resetsAt: fiveHourReset,
+      },
+      {
+        label: "Weekly",
+        usedPercent: providerId === "claude" ? 100 : 64,
+        windowMinutes: 10_080 as const,
+        resetsAt: weeklyReset,
+      },
+    ],
+  }));
+  const mediumEvidence = {
+    sampleCount: 6,
+    distinctCaptureCount: 6,
+    spanSeconds: 1_800,
+    increasePercent: 5,
+  };
+  const report: QuotaReport = {
+    snapshots,
+    forecasts: [
+      {
+        providerId: "codex",
+        windowMinutes: 300,
+        resetsAt: fiveHourReset,
+        state: "insufficient",
+        evidence: {
+          sampleCount: 1,
+          distinctCaptureCount: 1,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+      },
+      {
+        providerId: "codex",
+        windowMinutes: 10_080,
+        resetsAt: weeklyReset,
+        state: "projected-runout",
+        confidence: "high",
+        calculatedAt: capturedAt,
+        evidenceStartAt: capturedAt - 86_400,
+        evidenceEndAt: capturedAt,
+        projectedRunoutAt: capturedAt + 5_400,
+        evidence: {
+          sampleCount: 10,
+          distinctCaptureCount: 10,
+          spanSeconds: 86_400,
+          increasePercent: 10,
+        },
+      },
+      {
+        providerId: "claude",
+        windowMinutes: 300,
+        resetsAt: fiveHourReset,
+        state: "stale-paused",
+        evidence: {
+          sampleCount: 0,
+          distinctCaptureCount: 0,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+        retainedEstimate: {
+          state: "safe-through-reset",
+          confidence: "medium",
+          calculatedAt: capturedAt - 301,
+          evidenceStartAt: capturedAt - 2_101,
+          evidenceEndAt: capturedAt - 301,
+          evidence: mediumEvidence,
+        },
+      },
+      {
+        providerId: "claude",
+        windowMinutes: 10_080,
+        resetsAt: weeklyReset,
+        state: "exhausted",
+        calculatedAt: capturedAt,
+        evidence: {
+          sampleCount: 0,
+          distinctCaptureCount: 0,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+      },
+    ],
+  };
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, report);
+
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const panel = (await popup.webContents.executeJavaScript(`(() => {
+      const content = document.querySelector("[data-panel-content]");
+      const meters = [...document.querySelectorAll('[role="meter"]')];
+      const forecastTitles = [...document.querySelectorAll("p[title]")]
+        .map((node) => node.getAttribute("title") ?? "")
+        .filter((title) => title.includes("Forecast"));
+      const text = document.querySelector("main")?.textContent ?? "";
+      const buttons = [...document.querySelectorAll("button")];
+      const focusableControl = (label) => {
+        const button = buttons.find(
+          (candidate) => candidate.textContent?.trim() === label
+        );
+        const bounds = button?.getBoundingClientRect();
+        return Boolean(
+          button &&
+          !button.disabled &&
+          button.tabIndex >= 0 &&
+          bounds &&
+          bounds.width > 0 &&
+          bounds.height > 0
+        );
+      };
+      return {
+        meterCount: meters.length,
+        forecastTitles,
+        text,
+        noVerticalOverflow:
+          Boolean(content) && content.scrollHeight <= content.clientHeight + 1,
+        refreshFocusable: focusableControl("Refresh"),
+        quitFocusable: focusableControl("Quit")
+      };
+    })()`)) as {
+      meterCount: number;
+      forecastTitles: string[];
+      text: string;
+      noVerticalOverflow: boolean;
+      refreshFocusable: boolean;
+      quitFocusable: boolean;
+    };
+    if (
+      panel.meterCount === 4 &&
+      panel.forecastTitles.length === 4 &&
+      panel.text.includes("Not enough history") &&
+      panel.text.includes("Forecast paused — data stale") &&
+      panel.text.includes("Safe through reset") &&
+      panel.text.includes("May run out around") &&
+      panel.text.includes("Limit reached") &&
+      panel.text.includes("Last estimate:") &&
+      panel.text.includes("High confidence") &&
+      panel.noVerticalOverflow &&
+      panel.refreshFocusable &&
+      panel.quitFocusable
+    ) {
+      break;
+    }
+    if (attempt === 39) {
+      throw new Error(
+        `Four-window forecast panel failed: ${JSON.stringify(panel)}`,
+      );
+    }
+    await delay(25);
+  }
+
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    ...report,
+    snapshots: report.snapshots.map((snapshot) =>
+      snapshot.providerId === "claude"
+        ? {
+            ...snapshot,
+            windows: snapshot.windows.map((window) =>
+              window.windowMinutes === 10_080
+                ? { ...window, usedPercent: 50 }
+                : window,
+            ),
+          }
+        : snapshot,
+    ),
+  });
+  await delay(25);
+  const exhaustedMismatchIgnored =
+    (await popup.webContents.executeJavaScript(`(() => {
+      const text = document.querySelector("main")?.textContent ?? "";
+      return text.includes("Limit reached") &&
+        !text.includes("50% remaining");
+    })()`)) as boolean;
+  if (!exhaustedMismatchIgnored) {
+    throw new Error(
+      "Preload accepted exhausted forecast below 100 percent",
+    );
+  }
+
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    ...report,
+    forecasts: [
+      {
+        ...report.forecasts[0],
+        state: "unavailable-error",
+        unexpected: true,
+      },
+    ],
+  });
+  await delay(25);
+  const malformedIgnored = !(await popup.webContents.executeJavaScript(
+    `document.querySelector("main")?.textContent?.includes(
+      "Forecast unavailable"
+    ) ?? false`,
+  ));
+  if (!malformedIgnored) {
+    throw new Error("Preload accepted a malformed forecast update");
+  }
+
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    ...report,
+    forecasts: [
+      {
+        providerId: "codex",
+        windowMinutes: 300,
+        resetsAt: fiveHourReset,
+        state: "safe-through-reset",
+        confidence: "medium",
+        calculatedAt: capturedAt,
+        evidenceStartAt: capturedAt - 1_800,
+        evidenceEndAt: capturedAt,
+        evidence: mediumEvidence,
+      },
+      ...report.forecasts.slice(1),
+    ],
+  } satisfies QuotaReport);
+  await delay(25);
+  const safeRendered = (await popup.webContents.executeJavaScript(
+    `document.querySelector("main")?.textContent?.includes(
+      "Forecast · Safe through reset"
+    ) ?? false`,
+  )) as boolean;
+  if (!safeRendered) {
+    throw new Error("Safe-through-reset forecast did not render");
+  }
+
+  popup.webContents.send(IPC_CHANNELS.quotaUpdated, {
+    ...report,
+    forecasts: [
+      {
+        providerId: "codex",
+        windowMinutes: 300,
+        resetsAt: fiveHourReset,
+        state: "unavailable-error",
+        evidence: {
+          sampleCount: 0,
+          distinctCaptureCount: 0,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+      },
+      ...report.forecasts.slice(1),
+    ],
+  } satisfies QuotaReport);
+  await waitForPanelCopy("Forecast unavailable");
+  log("self-test-forecast-panel-pass", {
+    states: [
+      "insufficient",
+      "stale-paused",
+      "safe-through-reset",
+      "projected-runout",
+      "exhausted",
+      "unavailable-error",
+    ],
+    retainedStaleEstimate: true,
+    windows: 4,
+    noVerticalOverflow: true,
+    strictUpdateValidation: true,
+  });
+}
+
 async function verifyClaudeSetupStatesRendering(): Promise<void> {
   const settingsPath = getClaudeHookPaths().settingsPath;
   await fs.promises.writeFile(
@@ -1044,14 +1436,19 @@ async function runSelfTest(): Promise<void> {
   log("self-test-tray-states-pass");
   await verifyRendererBoundary();
 
-  const snapshots = (await popup.webContents.executeJavaScript(
+  const report = (await popup.webContents.executeJavaScript(
     "window.aiUsageMonitor.readQuota()",
-  )) as unknown[];
-  if (snapshots.length !== 2 || state.providerReads !== 0) {
+  )) as QuotaReport;
+  if (
+    report.snapshots.length !== 2 ||
+    report.forecasts.length !== 0 ||
+    state.providerReads !== 0
+  ) {
     throw new Error("Read request did not return the immediate memory cache");
   }
   log("self-test-read-pass", {
-    snapshots: snapshots.length,
+    snapshots: report.snapshots.length,
+    forecasts: report.forecasts.length,
     providerReads: state.providerReads,
   });
   await verifyPanelRendering();
@@ -1116,6 +1513,7 @@ async function runSelfTest(): Promise<void> {
     isolated: true,
     installs: state.claudeHookInstalls,
   });
+  await verifyForecastPanelRendering();
 
   const invalidInstallRejected =
     (await popup.webContents.executeJavaScript(
@@ -1214,6 +1612,96 @@ async function runSelfTest(): Promise<void> {
   }
   log("self-test-cached-read-pass");
 
+  const workingHistoryStore = quotaHistoryStore;
+  const originalProviderReads = providerReaders.map(
+    (reader) => reader.readQuota,
+  );
+  const failureCapturedAt = nowSeconds();
+  for (const reader of providerReaders) {
+    reader.readQuota = async () => ({
+      providerId: reader.providerId,
+      connectionState: "connected",
+      capturedAt: failureCapturedAt,
+      windows: [
+        {
+          label: "Five hours",
+          usedPercent: 42,
+          windowMinutes: 300,
+          resetsAt: failureCapturedAt + 3_600,
+        },
+        {
+          label: "Weekly",
+          usedPercent: 64,
+          windowMinutes: 10_080,
+          resetsAt: failureCapturedAt + 604_800,
+        },
+      ],
+    });
+  }
+  try {
+    let readAfterFailedAppend = false;
+    quotaHistoryStore = {
+      append: async () => {
+        throw new Error("injected history append failure");
+      },
+      readCurrent: async () => {
+        readAfterFailedAppend = true;
+        return [];
+      },
+    };
+    const appendFailureReport =
+      (await popup.webContents.executeJavaScript(
+        'window.aiUsageMonitor.forceRefresh({ reason: "user" })',
+      )) as QuotaReport;
+    if (
+      readAfterFailedAppend ||
+      appendFailureReport.snapshots.length !== 2 ||
+      !appendFailureReport.snapshots.every(
+        (snapshot) => snapshot.connectionState === "connected",
+      ) ||
+      appendFailureReport.forecasts.length !== 4 ||
+      !appendFailureReport.forecasts.every(
+        (forecast) => forecast.state === "unavailable-error",
+      )
+    ) {
+      throw new Error(
+        "History append failure escaped the quota refresh",
+      );
+    }
+
+    quotaHistoryStore = {
+      append: async () => undefined,
+      readCurrent: async () => {
+        throw new Error("injected history read failure");
+      },
+    };
+    const readFailureReport =
+      (await popup.webContents.executeJavaScript(
+        'window.aiUsageMonitor.forceRefresh({ reason: "user" })',
+      )) as QuotaReport;
+    if (
+      readFailureReport.snapshots.length !== 2 ||
+      !readFailureReport.snapshots.every(
+        (snapshot) => snapshot.connectionState === "connected",
+      ) ||
+      readFailureReport.forecasts.length !== 4 ||
+      !readFailureReport.forecasts.every(
+        (forecast) => forecast.state === "unavailable-error",
+      )
+    ) {
+      throw new Error("History read failure escaped the quota refresh");
+    }
+  } finally {
+    quotaHistoryStore = workingHistoryStore;
+    providerReaders.forEach((reader, index) => {
+      const originalRead = originalProviderReads[index];
+      if (originalRead) {
+        reader.readQuota = originalRead;
+      }
+    });
+  }
+  log("self-test-forecast-failure-contained-pass");
+
   const originalTray = tray;
   originalTray.destroy();
   const recreatedTray = ensureTray("self-test-explorer-restart");
@@ -1293,6 +1781,18 @@ app.whenReady().then(async () => {
       recursive: true,
     });
     await fs.promises.writeFile(selfTestSettingsPath, "{\n}\n", "utf8");
+  }
+  const localAppDataDirectory = SELF_TEST
+    ? selfTestOnboardingRoot
+    : process.env.LOCALAPPDATA;
+  if (localAppDataDirectory) {
+    quotaHistoryStore = new FileQuotaHistoryStore(
+      resolveQuotaHistoryPath(localAppDataDirectory),
+    );
+  } else {
+    safeLog("quota-history-disabled", {
+      code: "local-app-data-unavailable",
+    });
   }
   popup = createPopup();
   tray = createTray("startup");

@@ -1,6 +1,7 @@
 import { useEffect, useReducer, useState } from "react";
 import type {
   ClaudeSetupState,
+  QuotaForecast,
   QuotaSnapshot,
   QuotaWindow,
 } from "../shared/contracts";
@@ -9,6 +10,7 @@ import {
   canRenderClaudeQuota,
   describeProviderState,
   formatCountdown,
+  formatForecast,
   formatReadingAge,
   getConnectedProviderSeverity,
   getPanelSummaryPresentation,
@@ -208,16 +210,25 @@ function Gauge({
   quotaWindow,
   nowSeconds,
   stale,
+  forecast,
 }: {
   quotaWindow: QuotaWindow;
   nowSeconds: number;
   stale: boolean;
+  forecast: QuotaForecast | undefined;
 }) {
   const remainingPercent = toRemainingPercent(quotaWindow.usedPercent);
   const severity = getSeverity(quotaWindow.usedPercent, stale);
   const tokens = severityTokens[severity];
   const countdown = formatCountdown(quotaWindow.resetsAt, nowSeconds);
   const label = getWindowLabel(quotaWindow.windowMinutes);
+  const forecastText = formatForecast(
+    forecast,
+    nowSeconds,
+    undefined,
+    undefined,
+    stale,
+  );
 
   return (
     <div
@@ -250,6 +261,9 @@ function Gauge({
           </span>
         ) : null}
       </div>
+      <p className={gaugeTokens.forecast} title={forecastText}>
+        {forecastText}
+      </p>
     </div>
   );
 }
@@ -257,9 +271,11 @@ function Gauge({
 function ConnectedProviderCard({
   snapshot,
   nowSeconds,
+  forecasts,
 }: {
   snapshot: QuotaSnapshot;
   nowSeconds: number;
+  forecasts: QuotaForecast[];
 }) {
   const stale = isClaudeSnapshotStale(snapshot, nowSeconds);
   const windows = orderQuotaWindows(snapshot.windows);
@@ -301,6 +317,12 @@ function ConnectedProviderCard({
               nowSeconds={nowSeconds}
               quotaWindow={quotaWindow}
               stale={stale}
+              forecast={forecasts.find(
+                (forecast) =>
+                  forecast.providerId === snapshot.providerId &&
+                  forecast.windowMinutes === quotaWindow.windowMinutes &&
+                  forecast.resetsAt === quotaWindow.resetsAt,
+              )}
             />
           ))}
         </div>
@@ -484,12 +506,14 @@ function MissingProviderCard({ providerId }: { providerId: string }) {
 function ProviderSection({
   providerId,
   snapshots,
+  forecasts,
   nowSeconds,
   claudeSetup,
   onInstallClaudeHook,
 }: {
   providerId: string;
   snapshots: QuotaSnapshot[];
+  forecasts: QuotaForecast[];
   nowSeconds: number;
   claudeSetup: ClaudeSetupState | null;
   onInstallClaudeHook: () => Promise<void>;
@@ -512,7 +536,11 @@ function ProviderSection({
     }
   }
   return snapshot.connectionState === "connected" ? (
-    <ConnectedProviderCard nowSeconds={nowSeconds} snapshot={snapshot} />
+    <ConnectedProviderCard
+      forecasts={forecasts}
+      nowSeconds={nowSeconds}
+      snapshot={snapshot}
+    />
   ) : (
     <ProviderStateCard snapshot={snapshot} />
   );
@@ -560,20 +588,20 @@ export function App() {
 
   useEffect(() => {
     let active = true;
-    const unsubscribe = window.aiUsageMonitor.onQuotaUpdated((snapshots) => {
+    const unsubscribe = window.aiUsageMonitor.onQuotaUpdated((report) => {
       if (active) {
-        dispatch({ type: "load-succeeded", snapshots });
+        dispatch({ type: "load-succeeded", report });
         setClaudeSetup((setup) =>
-          advanceClaudeSetupFromSnapshots(setup, snapshots),
+          advanceClaudeSetupFromSnapshots(setup, report.snapshots),
         );
       }
     });
     void window.aiUsageMonitor.readQuota().then(
-      (snapshots) => {
+      (report) => {
         if (active) {
-          dispatch({ type: "load-succeeded", snapshots });
+          dispatch({ type: "load-succeeded", report });
           setClaudeSetup((setup) =>
-            advanceClaudeSetupFromSnapshots(setup, snapshots),
+            advanceClaudeSetupFromSnapshots(setup, report.snapshots),
           );
         }
       },
@@ -610,12 +638,12 @@ export function App() {
   async function refresh(): Promise<void> {
     dispatch({ type: "refresh-started" });
     try {
-      const snapshots = await window.aiUsageMonitor.forceRefresh({
+      const report = await window.aiUsageMonitor.forceRefresh({
         reason: "user",
       });
-      dispatch({ type: "refresh-succeeded", snapshots });
+      dispatch({ type: "refresh-succeeded", report });
       setClaudeSetup((setup) =>
-        advanceClaudeSetupFromSnapshots(setup, snapshots),
+        advanceClaudeSetupFromSnapshots(setup, report.snapshots),
       );
     } catch (error) {
       dispatch({
@@ -676,6 +704,7 @@ export function App() {
             />
             <ProviderSection
               providerId="codex"
+              forecasts={panelState.forecasts}
               snapshots={panelState.snapshots}
               nowSeconds={nowSeconds}
               claudeSetup={claudeSetup}
@@ -683,6 +712,7 @@ export function App() {
             />
             <ProviderSection
               providerId="claude"
+              forecasts={panelState.forecasts}
               snapshots={panelState.snapshots}
               nowSeconds={nowSeconds}
               claudeSetup={claudeSetup}

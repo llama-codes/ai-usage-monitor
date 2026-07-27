@@ -1,6 +1,9 @@
 import {
   QUOTA_WINDOW_MINUTES,
   type ClaudeSetupState,
+  type QuotaCalculatedForecastEstimate,
+  type QuotaForecast,
+  type QuotaReport,
   type QuotaSnapshot,
   type QuotaWindow,
 } from "../shared/contracts";
@@ -18,20 +21,22 @@ export type PanelState = {
   initialLoading: boolean;
   refreshing: boolean;
   snapshots: QuotaSnapshot[];
+  forecasts: QuotaForecast[];
   error?: string;
 };
 
 export type PanelAction =
-  | { type: "load-succeeded"; snapshots: QuotaSnapshot[] }
+  | { type: "load-succeeded"; report: QuotaReport }
   | { type: "load-failed"; message: string }
   | { type: "refresh-started" }
-  | { type: "refresh-succeeded"; snapshots: QuotaSnapshot[] }
+  | { type: "refresh-succeeded"; report: QuotaReport }
   | { type: "refresh-failed"; message: string };
 
 export const initialPanelState: PanelState = {
   initialLoading: true,
   refreshing: false,
   snapshots: [],
+  forecasts: [],
 };
 
 export function reducePanelState(
@@ -43,7 +48,8 @@ export function reducePanelState(
       return {
         initialLoading: false,
         refreshing: false,
-        snapshots: action.snapshots,
+        snapshots: action.report.snapshots,
+        forecasts: action.report.forecasts,
       };
     case "load-failed":
       return {
@@ -58,7 +64,8 @@ export function reducePanelState(
       return {
         initialLoading: false,
         refreshing: false,
-        snapshots: action.snapshots,
+        snapshots: action.report.snapshots,
+        forecasts: action.report.forecasts,
       };
     case "refresh-failed":
       return {
@@ -187,6 +194,99 @@ export function formatReadingAge(
     return `Updated ${Math.floor(age / 60)}m ago`;
   }
   return `Updated ${Math.floor(age / 3_600)}h ago`;
+}
+
+export function formatForecast(
+  forecast: QuotaForecast | undefined,
+  nowSeconds: number,
+  locales?: Intl.LocalesArgument,
+  timeZone?: string,
+  pausedForStaleData = false,
+): string {
+  if (pausedForStaleData || forecast?.state === "stale-paused") {
+    const retained =
+      forecast?.state === "stale-paused"
+        ? forecast.retainedEstimate
+        : forecast?.state === "safe-through-reset" ||
+            forecast?.state === "projected-runout" ||
+            forecast?.state === "exhausted"
+          ? forecast
+          : undefined;
+    return retained
+      ? `Forecast paused — data stale · Last estimate: ${formatEstimate(
+          retained,
+          nowSeconds,
+          locales,
+          timeZone,
+          true,
+        )}`
+      : "Forecast paused — data stale";
+  }
+  if (!forecast || forecast.state === "unavailable-error") {
+    return "Forecast unavailable";
+  }
+  if (forecast.state === "insufficient") {
+    return "Forecast · Not enough history";
+  }
+  if (forecast.state === "exhausted") {
+    return "Forecast · Limit reached";
+  }
+  if (
+    forecast.state === "projected-runout" &&
+    forecast.projectedRunoutAt <= nowSeconds
+  ) {
+    return "Forecast unavailable";
+  }
+  return `Forecast · ${formatEstimate(
+    forecast,
+    nowSeconds,
+    locales,
+    timeZone,
+    false,
+  )}`;
+}
+
+function formatEstimate(
+  forecast: QuotaCalculatedForecastEstimate,
+  nowSeconds: number,
+  locales: Intl.LocalesArgument | undefined,
+  timeZone: string | undefined,
+  retained: boolean,
+): string {
+  if (forecast.state === "exhausted") {
+    return "Limit reached";
+  }
+  const confidence = `${
+    forecast.confidence === "high" ? "High" : "Medium"
+  } confidence`;
+  if (forecast.state === "safe-through-reset") {
+    return `Safe through reset · ${confidence}`;
+  }
+  const projectedAt = forecast.projectedRunoutAt;
+  const timestamp = new Intl.DateTimeFormat(locales, {
+    hour: "numeric",
+    minute: "2-digit",
+    ...(timeZone ? { timeZone } : {}),
+  }).format(new Date(projectedAt * 1_000));
+  return retained
+    ? `Runout around ${timestamp} · ${confidence}`
+    : `May run out around ${timestamp} (${formatForecastDuration(
+        projectedAt - nowSeconds,
+      )}) · ${confidence}`;
+}
+
+function formatForecastDuration(seconds: number): string {
+  const totalMinutes = Math.max(1, Math.ceil(seconds / 60));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) {
+    return `in ${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `in ${hours}h ${minutes}m`;
+  }
+  return `in ${minutes}m`;
 }
 
 export function getProviderName(providerId: string): string {

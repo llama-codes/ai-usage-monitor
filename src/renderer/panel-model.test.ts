@@ -5,6 +5,7 @@ import {
   advanceClaudeSetupFromSnapshots,
   canRenderClaudeQuota,
   formatCountdown,
+  formatForecast,
   formatReadingAge,
   getConnectedProviderSeverity,
   getPanelSummaryPresentation,
@@ -17,6 +18,7 @@ import {
   reducePanelState,
   toRemainingPercent,
 } from "./panel-model";
+import type { QuotaForecast } from "../shared/contracts";
 
 test("derives Claude setup, pending, conflict, and retry presentation", () => {
   assert.equal(canRenderClaudeQuota(null), false);
@@ -326,6 +328,102 @@ test("formats reading ages deterministically", () => {
   assert.equal(formatReadingAge(NOW, NOW + 360), "Updated 6m ago");
 });
 
+test("formats every forecast state truthfully and localizes projected time", () => {
+  const evidence = {
+    sampleCount: 10,
+    distinctCaptureCount: 10,
+    spanSeconds: 3_600,
+    increasePercent: 10,
+  };
+  const base = {
+    providerId: "codex",
+    windowMinutes: 300 as const,
+    resetsAt: NOW + 10_000,
+    evidence,
+  };
+  const provenance = {
+    calculatedAt: NOW,
+    evidenceStartAt: NOW - 3_600,
+    evidenceEndAt: NOW,
+  };
+  assert.equal(formatForecast(undefined, NOW), "Forecast unavailable");
+  assert.equal(
+    formatForecast({ ...base, state: "insufficient" }, NOW),
+    "Forecast · Not enough history",
+  );
+  assert.equal(
+    formatForecast({ ...base, state: "stale-paused" }, NOW),
+    "Forecast paused — data stale",
+  );
+  assert.equal(
+    formatForecast(
+      {
+        ...base,
+        state: "safe-through-reset",
+        confidence: "medium",
+        ...provenance,
+      },
+      NOW,
+    ),
+    "Forecast · Safe through reset · Medium confidence",
+  );
+  const projected: QuotaForecast = {
+    ...base,
+    state: "projected-runout",
+    confidence: "high",
+    ...provenance,
+    projectedRunoutAt: NOW + 5_400,
+  };
+  const label = formatForecast(projected, NOW, "en-US", "UTC");
+  assert.match(
+    label,
+    /^Forecast · May run out around .+ \(in 1h 30m\) · High confidence$/,
+  );
+  assert.equal(
+    formatForecast(
+      {
+        ...base,
+        state: "exhausted",
+        calculatedAt: NOW,
+        evidence: {
+          sampleCount: 0,
+          distinctCaptureCount: 0,
+          spanSeconds: 0,
+          increasePercent: 0,
+        },
+      },
+      NOW,
+    ),
+    "Forecast · Limit reached",
+  );
+  const paused = formatForecast(
+    {
+      ...base,
+      state: "stale-paused",
+      evidence: {
+        sampleCount: 0,
+        distinctCaptureCount: 0,
+        spanSeconds: 0,
+        increasePercent: 0,
+      },
+      retainedEstimate: {
+        state: "projected-runout",
+        confidence: "high",
+        ...provenance,
+        projectedRunoutAt: NOW + 5_400,
+        evidence,
+      },
+    },
+    NOW,
+    "en-US",
+    "UTC",
+  );
+  assert.match(
+    paused,
+    /^Forecast paused — data stale · Last estimate: Runout around .+ · High confidence$/,
+  );
+});
+
 test("covers every non-connected provider-state row without gauges", () => {
   const cases: Array<{
     state: ProviderConnectionState;
@@ -380,7 +478,7 @@ test("refresh keeps prior snapshots through failure and recovers", () => {
   const oldSnapshots = [snapshot()];
   let state = reducePanelState(initialPanelState, {
     type: "load-succeeded",
-    snapshots: oldSnapshots,
+    report: { snapshots: oldSnapshots, forecasts: [] },
   });
   state = reducePanelState(state, { type: "refresh-started" });
   assert.equal(state.refreshing, true);
@@ -397,7 +495,7 @@ test("refresh keeps prior snapshots through failure and recovers", () => {
   const freshSnapshots = [{ ...snapshot(), capturedAt: NOW + 10 }];
   state = reducePanelState(state, {
     type: "refresh-succeeded",
-    snapshots: freshSnapshots,
+    report: { snapshots: freshSnapshots, forecasts: [] },
   });
   assert.equal(state.error, undefined);
   assert.equal(state.snapshots, freshSnapshots);

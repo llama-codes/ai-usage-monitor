@@ -28,6 +28,74 @@ export type QuotaSnapshot = {
   error?: string;
 };
 
+export type QuotaForecastState =
+  | "insufficient"
+  | "stale-paused"
+  | "safe-through-reset"
+  | "projected-runout"
+  | "exhausted"
+  | "unavailable-error";
+
+export type QuotaForecastConfidence = "medium" | "high";
+
+export type QuotaForecastEvidence = {
+  sampleCount: number;
+  distinctCaptureCount: number;
+  spanSeconds: number;
+  increasePercent: number;
+};
+
+type QuotaForecastBase = {
+  providerId: string;
+  windowMinutes: QuotaWindowMinutes;
+  resetsAt: number;
+};
+
+export type QuotaCalculatedForecastEstimate =
+  | {
+      state: "safe-through-reset";
+      confidence: QuotaForecastConfidence;
+      calculatedAt: number;
+      evidenceStartAt: number;
+      evidenceEndAt: number;
+      evidence: QuotaForecastEvidence;
+    }
+  | {
+      state: "projected-runout";
+      confidence: QuotaForecastConfidence;
+      calculatedAt: number;
+      evidenceStartAt: number;
+      evidenceEndAt: number;
+      projectedRunoutAt: number;
+      evidence: QuotaForecastEvidence;
+    }
+  | {
+      state: "exhausted";
+      calculatedAt: number;
+      evidence: QuotaForecastEvidence;
+    };
+
+export type QuotaForecast =
+  | (QuotaForecastBase & {
+      state: "insufficient";
+      evidence: QuotaForecastEvidence;
+    })
+  | (QuotaForecastBase & {
+      state: "stale-paused";
+      evidence: QuotaForecastEvidence;
+      retainedEstimate?: QuotaCalculatedForecastEstimate;
+    })
+  | (QuotaForecastBase & QuotaCalculatedForecastEstimate)
+  | (QuotaForecastBase & {
+      state: "unavailable-error";
+      evidence: QuotaForecastEvidence;
+    });
+
+export type QuotaReport = {
+  snapshots: QuotaSnapshot[];
+  forecasts: QuotaForecast[];
+};
+
 export type ForceRefreshRequest = {
   reason: "user";
 };
@@ -43,11 +111,11 @@ export type ClaudeSetupState =
   | { status: "conflict" }
   | { status: "error"; message: string };
 
-export type QuotaUpdateListener = (snapshots: QuotaSnapshot[]) => void;
+export type QuotaUpdateListener = (report: QuotaReport) => void;
 
 export type AIUsageMonitorAPI = {
-  readQuota: () => Promise<QuotaSnapshot[]>;
-  forceRefresh: (request: ForceRefreshRequest) => Promise<QuotaSnapshot[]>;
+  readQuota: () => Promise<QuotaReport>;
+  forceRefresh: (request: ForceRefreshRequest) => Promise<QuotaReport>;
   onQuotaUpdated: (listener: QuotaUpdateListener) => () => void;
   readClaudeSetup: () => Promise<ClaudeSetupState>;
   installClaudeHook: (
@@ -121,6 +189,281 @@ export function isQuotaSnapshot(value: unknown): value is QuotaSnapshot {
   );
 }
 
+export function isQuotaReport(value: unknown): value is QuotaReport {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["snapshots", "forecasts"]) &&
+    Array.isArray(value.snapshots) &&
+    value.snapshots.every(isQuotaSnapshot) &&
+    Array.isArray(value.forecasts) &&
+    value.forecasts.every(isQuotaForecast) &&
+    forecastsMatchSnapshots(value.forecasts, value.snapshots)
+  );
+}
+
+function forecastsMatchSnapshots(
+  forecasts: QuotaForecast[],
+  snapshots: QuotaSnapshot[],
+): boolean {
+  const keys = new Set<string>();
+  for (const forecast of forecasts) {
+    const key = `${forecast.providerId}:${forecast.windowMinutes}`;
+    if (keys.has(key)) {
+      return false;
+    }
+    keys.add(key);
+    const snapshot = snapshots.find(
+      (candidate) => candidate.providerId === forecast.providerId,
+    );
+    const window = snapshot?.windows.find(
+      (candidate) =>
+        candidate.windowMinutes === forecast.windowMinutes &&
+        candidate.resetsAt === forecast.resetsAt,
+    );
+    if (
+      !snapshot ||
+      !window ||
+      (forecast.state === "exhausted" &&
+        (window.usedPercent < 100 ||
+          window.resetsAt <= snapshot.capturedAt)) ||
+      (forecast.state === "projected-runout" &&
+        (forecast.projectedRunoutAt ?? forecast.resetsAt) >=
+          forecast.resetsAt)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isQuotaForecast(value: unknown): value is QuotaForecast {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const baseKeys = [
+    "providerId",
+    "windowMinutes",
+    "resetsAt",
+    "state",
+    "evidence",
+  ];
+  const state = value.state;
+  const validKeys =
+    state === "projected-runout"
+      ? [
+          ...baseKeys,
+          "confidence",
+          "calculatedAt",
+          "evidenceStartAt",
+          "evidenceEndAt",
+          "projectedRunoutAt",
+        ]
+      : state === "safe-through-reset"
+        ? [
+            ...baseKeys,
+            "confidence",
+            "calculatedAt",
+            "evidenceStartAt",
+            "evidenceEndAt",
+          ]
+        : state === "exhausted"
+          ? [...baseKeys, "calculatedAt"]
+          : state === "stale-paused" && value.retainedEstimate !== undefined
+            ? [...baseKeys, "retainedEstimate"]
+            : baseKeys;
+  if (
+    !(
+    hasExactKeys(value, validKeys) &&
+    typeof value.providerId === "string" &&
+    value.providerId.length > 0 &&
+    isQuotaWindowMinutes(value.windowMinutes) &&
+    isUnixSeconds(value.resetsAt) &&
+    isForecastState(state) &&
+    isForecastEvidence(value.evidence)
+    )
+  ) {
+    return false;
+  }
+  if (state === "safe-through-reset" || state === "projected-runout") {
+    return (
+      isForecastConfidence(value.confidence) &&
+      isCalculatedProvenance(
+        value,
+        value.resetsAt,
+        value.windowMinutes,
+        value.confidence,
+      ) &&
+      (state !== "projected-runout" ||
+        (isUnixSeconds(value.projectedRunoutAt) &&
+          value.projectedRunoutAt > value.calculatedAt))
+    );
+  }
+  if (state === "exhausted") {
+    return (
+      isEmptyForecastEvidence(value.evidence) &&
+      isUnixSeconds(value.calculatedAt) &&
+      value.calculatedAt < value.resetsAt
+    );
+  }
+  if (state === "stale-paused") {
+    return (
+      isEmptyForecastEvidence(value.evidence) &&
+      (value.retainedEstimate === undefined ||
+        isRetainedEstimate(
+          value.retainedEstimate,
+          value.resetsAt,
+          value.windowMinutes,
+        ))
+    );
+  }
+  return state === "insufficient" || isEmptyForecastEvidence(value.evidence);
+}
+
+function isCalculatedProvenance(
+  value: Record<string, unknown>,
+  resetsAt: number,
+  windowMinutes: QuotaWindowMinutes,
+  confidence: QuotaForecastConfidence,
+): value is Record<string, unknown> & {
+  calculatedAt: number;
+  evidenceStartAt: number;
+  evidenceEndAt: number;
+} {
+  return (
+    isUnixSeconds(value.calculatedAt) &&
+    isUnixSeconds(value.evidenceStartAt) &&
+    isUnixSeconds(value.evidenceEndAt) &&
+    value.evidenceStartAt <= value.evidenceEndAt &&
+    value.evidenceEndAt <= value.calculatedAt &&
+    value.calculatedAt < resetsAt &&
+    isForecastEvidence(value.evidence) &&
+    meetsConfidenceEvidence(value.evidence, windowMinutes, confidence) &&
+    value.evidence.spanSeconds ===
+      value.evidenceEndAt - value.evidenceStartAt
+  );
+}
+
+function isRetainedEstimate(
+  value: unknown,
+  resetsAt: number,
+  windowMinutes: QuotaWindowMinutes,
+): boolean {
+  if (!isRecord(value) || !isForecastEvidence(value.evidence)) {
+    return false;
+  }
+  const baseKeys = ["state", "calculatedAt", "evidence"];
+  if (value.state === "exhausted") {
+    return (
+      hasExactKeys(value, baseKeys) &&
+      isEmptyForecastEvidence(value.evidence) &&
+      isUnixSeconds(value.calculatedAt) &&
+      value.calculatedAt < resetsAt
+    );
+  }
+  const calculatedKeys = [
+    ...baseKeys,
+    "confidence",
+    "evidenceStartAt",
+    "evidenceEndAt",
+  ];
+  if (value.state === "safe-through-reset") {
+    return (
+      hasExactKeys(value, calculatedKeys) &&
+      isForecastConfidence(value.confidence) &&
+      isCalculatedProvenance(
+        value,
+        resetsAt,
+        windowMinutes,
+        value.confidence,
+      )
+    );
+  }
+  if (value.state === "projected-runout") {
+    return (
+      hasExactKeys(value, [...calculatedKeys, "projectedRunoutAt"]) &&
+      isForecastConfidence(value.confidence) &&
+      isCalculatedProvenance(
+        value,
+        resetsAt,
+        windowMinutes,
+        value.confidence,
+      ) &&
+      isUnixSeconds(value.projectedRunoutAt) &&
+      value.projectedRunoutAt > value.calculatedAt &&
+      value.projectedRunoutAt < resetsAt
+    );
+  }
+  return false;
+}
+
+function meetsConfidenceEvidence(
+  value: QuotaForecastEvidence,
+  windowMinutes: QuotaWindowMinutes,
+  confidence: QuotaForecastConfidence,
+): boolean {
+  const high = confidence === "high";
+  return (
+    value.sampleCount >= (high ? 10 : 6) &&
+    value.distinctCaptureCount >= (high ? 10 : 6) &&
+    value.increasePercent >= (high ? 10 : 5) &&
+    value.spanSeconds >=
+      (windowMinutes === QUOTA_WINDOW_MINUTES.fiveHours
+        ? (high ? 60 : 30) * 60
+        : (high ? 24 : 12) * 60 * 60)
+  );
+}
+
+function isForecastEvidence(
+  value: unknown,
+): value is QuotaForecastEvidence {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "sampleCount",
+      "distinctCaptureCount",
+      "spanSeconds",
+      "increasePercent",
+    ]) &&
+    isBoundedInteger(value.sampleCount, 0, 64) &&
+    isBoundedInteger(
+      value.distinctCaptureCount,
+      0,
+      value.sampleCount as number,
+    ) &&
+    isUnixSeconds(value.spanSeconds) &&
+    typeof value.increasePercent === "number" &&
+    Number.isFinite(value.increasePercent) &&
+    value.increasePercent >= 0 &&
+    value.increasePercent <= 100
+  );
+}
+
+function isEmptyForecastEvidence(value: QuotaForecastEvidence): boolean {
+  return (
+    value.sampleCount === 0 &&
+    value.distinctCaptureCount === 0 &&
+    value.spanSeconds === 0 &&
+    value.increasePercent === 0
+  );
+}
+
+function isForecastState(value: unknown): value is QuotaForecastState {
+  return (
+    value === "insufficient" ||
+    value === "stale-paused" ||
+    value === "safe-through-reset" ||
+    value === "projected-runout" ||
+    value === "exhausted" ||
+    value === "unavailable-error"
+  );
+}
+
+function isForecastConfidence(
+  value: unknown,
+): value is QuotaForecastConfidence {
+  return value === "medium" || value === "high";
+}
+
 function isQuotaWindow(value: unknown): value is QuotaWindow {
   if (!isRecord(value)) {
     return false;
@@ -138,9 +481,38 @@ function isQuotaWindow(value: unknown): value is QuotaWindow {
     Number.isFinite(value.usedPercent) &&
     value.usedPercent >= 0 &&
     value.usedPercent <= 100 &&
-    (value.windowMinutes === QUOTA_WINDOW_MINUTES.fiveHours ||
-      value.windowMinutes === QUOTA_WINDOW_MINUTES.weekly) &&
+    isQuotaWindowMinutes(value.windowMinutes) &&
     isUnixSeconds(value.resetsAt)
+  );
+}
+
+function isQuotaWindowMinutes(value: unknown): value is QuotaWindowMinutes {
+  return (
+    value === QUOTA_WINDOW_MINUTES.fiveHours ||
+    value === QUOTA_WINDOW_MINUTES.weekly
+  );
+}
+
+function isBoundedInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) >= minimum &&
+    (value as number) <= maximum
+  );
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return (
+    actual.length === keys.length &&
+    actual.every((key) => keys.includes(key))
   );
 }
 

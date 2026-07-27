@@ -91,6 +91,8 @@ export const gaugeTokens = {
   countdown:
     "min-w-0 flex-1 truncate font-mono text-[10px] font-semibold tabular-nums text-stone-400",
   staleHint: "sr-only",
+  forecast:
+    "mt-0.5 truncate font-mono text-[8px] leading-2.5 tabular-nums text-stone-500",
 } as const;
 
 export const stateTokens = {
