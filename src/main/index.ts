@@ -138,6 +138,20 @@ type ProviderReader = {
 
 type RefreshReason = "startup" | "poll" | "user" | "tray-menu" | "resume";
 
+function configureWindowsStartup(): void {
+  if (process.platform !== "win32" || !app.isPackaged || SELF_TEST) {
+    return;
+  }
+
+  app.setLoginItemSettings({
+    openAtLogin: true,
+    path: process.execPath,
+    name: "AIUsageMonitor",
+    enabled: true,
+  });
+  log("windows-startup-configured");
+}
+
 const providerReaders: ProviderReader[] = [
   { providerId: "codex", readQuota: () => codexProvider.readQuota() },
   { providerId: "claude", readQuota: () => claudeProvider.readQuota() },
@@ -2066,6 +2080,7 @@ app.on("window-all-closed", () => {
 });
 
 app.whenReady().then(async () => {
+  configureWindowsStartup();
   if (SELF_TEST) {
     selfTestOnboardingRoot = await fs.promises.mkdtemp(
       path.join(os.tmpdir(), "aum-electron-onboarding-"),
